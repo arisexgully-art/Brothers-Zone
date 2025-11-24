@@ -5,7 +5,7 @@ import aiohttp
 import re
 import os
 from datetime import datetime
-from aiohttp import web # Render Port Fix এর জন্য
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -24,8 +24,12 @@ from aiogram.types import (
 # --- কনফিগারেশন ---
 BOT_TOKEN = "8070506568:AAE6mUi2wcXMRTnZRwHUut66Nlu1NQC8Opo"
 ADMIN_IDS = [8308179143, 5085250851]
+
+# API Settings
 API_TOKEN = "Rk5CRTSGcX9fh1WHeIVxYViVlEhaUmSDXG1Qe1dOc2ZykmZGiw=="
 API_URL = "http://51.77.216.195/crapi/dgroup/viewstats"
+
+# Group ID
 GROUP_ID = -1003472422744
 
 # লগিং
@@ -64,18 +68,32 @@ class AdminStates(StatesGroup):
     waiting_number_input = State()
     last_msg_id = State()
 
-# --- API চেক ---
+# --- API চেক ফাংশন (DEBUG MODE ON) ---
 async def check_otp_api(phone_number):
-    params = {"token": API_TOKEN, "filternum": phone_number, "records": 10}
-    async with aiohttp.ClientSession() as session:
-        try:
+    # প্যারামিটার
+    params = {
+        "token": API_TOKEN,
+        "filternum": phone_number,
+        "records": 20  # রেকর্ড বাড়িয়ে দিয়েছি
+    }
+    
+    # SSL False করা হয়েছে যাতে কানেকশন ড্রপ না করে
+    try:
+        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False)) as session:
             async with session.get(API_URL, params=params) as resp:
                 if resp.status == 200:
                     data = await resp.json()
+                    
+                    # Debug Print (Console এ দেখার জন্য)
+                    # print(f"Checking {phone_number}: {data}") 
+                    
                     if data.get("status") == "success" and data.get("data"):
                         return data["data"]
-        except Exception as e:
-            logging.error(f"API Error: {e}")
+                else:
+                    print(f"API Error Status: {resp.status}")
+    except Exception as e:
+        print(f"API Connection Error: {e}")
+        
     return []
 
 # --- কিবোর্ড ---
@@ -285,32 +303,52 @@ async def user_buy_number(callback: types.CallbackQuery):
     text = f"🌎 {c_name} WS Number Assigned:\n<code>+{phone_number}</code>\n\nWaiting for OTP..."
     kb = [[InlineKeyboardButton(text="CHANGE NUMBER", callback_data=f"buy_{c_id}_{c_name}")], [InlineKeyboardButton(text="CHANGE COUNTRY", callback_data="show_country_list")], [InlineKeyboardButton(text="CANCEL OPERATION", callback_data="cancel_op")]]
     sent_msg = await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    
+    # টাস্ক শুরু হওয়ার মেসেজ টার্মিনালে দেখাবে
+    print(f"Started monitoring for: {phone_number}")
     user_tasks[user_id] = asyncio.create_task(otp_checker_task(bot, callback.message.chat.id, phone_number, c_name, sent_msg.message_id))
 
 async def otp_checker_task(bot: Bot, chat_id: int, phone_number: str, country_name: str, message_id: int):
     last_dt = None
     try:
-        for _ in range(120):
+        for _ in range(120): # Loop 120 times (10 mins)
             await asyncio.sleep(5)
             msgs = await check_otp_api(phone_number)
+            
+            # API যদি ডাটা পায়, কনসোলে প্রিন্ট করবে
             if msgs:
+                print(f"Data found for {phone_number}: {len(msgs)} messages")
                 latest = msgs[0]
-                if latest.get("dt") != last_dt:
+                
+                # যদি নতুন মেসেজ হয় (dt চেক) অথবা প্রথমবার চেক হয়
+                # last_dt None থাকলে প্রথম মেসেজটাই নেবে
+                if last_dt is None or latest.get("dt") != last_dt:
                     last_dt = latest.get("dt")
                     msg_body = latest.get("message", "")
+                    
+                    # Regex for OTP
                     otp_match = re.search(r'(?:\d{3}[- ]\d{3}|\d{3} \d{3}|\b\d{4,8}\b)', msg_body)
                     otp = otp_match.group(0) if otp_match else "N/A"
+                    
                     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    
+                    # Masked Number Logic for Group
                     masked_number = f"{phone_number[:4]}***{phone_number[-4:]}" if len(phone_number) > 7 else phone_number
+                    
+                    # Formats
                     user_text = f"🌎 Country : {country_name}\n🔢 Number : <code>{phone_number}</code>\n🔑 OTP : <code>{otp}</code>\n💸 Reward: 🔥"
                     group_text = f"✅ {country_name} Whatsapp OTP Received!\n━━━━━━━━━━━━━━━━━━━━\n📱 Number: <code>{masked_number}</code>\n🌍 Country: {country_name}\n⚙️ Service: Whatsapp\n🔒 OTP Code: <code>{otp}</code>\n⏳ Time: {current_time}\n━━━━━━━━━━━━━━━━━━━━\nMessage:\n{msg_body}"
+                    
+                    print(f"Sending OTP for {phone_number}")
                     await bot.send_message(chat_id, user_text)
                     try: await bot.send_message(GROUP_ID, group_text)
-                    except Exception as e: logging.error(f"Group Send Error: {e}")
+                    except Exception as e: 
+                        print(f"Group Send Error: {e}")
+                        
     except asyncio.CancelledError: pass
-    except Exception as e: logging.error(f"Task: {e}")
+    except Exception as e: print(f"Task Error: {e}")
 
-# --- WEB SERVER FOR RENDER (CRITICAL) ---
+# --- WEB SERVER FOR RENDER ---
 async def web_handler(request):
     return web.Response(text="Bot is running!")
 
@@ -325,7 +363,6 @@ async def start_web_server():
 
 async def main():
     print("Bot is running...")
-    # Render এ পোর্ট লিসেন করার জন্য ওয়েব সার্ভার স্টার্ট করছি
     await start_web_server()
     await dp.start_polling(bot)
 
