@@ -9,7 +9,7 @@ from datetime import datetime
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
+from aiogram.enums import ParseMode, ChatType, ChatMemberStatus
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -23,7 +23,8 @@ from aiogram.types import (
     ReplyKeyboardRemove
 )
 
-# --- কনফিগারেশন ---
+# ================= CONFIGURATION =================
+
 BOT_TOKEN = "8070506568:AAE6mUi2wcXMRTnZRwHUut66Nlu1NQC8Opo"
 ADMIN_IDS = [8308179143, 5085250851]
 
@@ -31,8 +32,10 @@ ADMIN_IDS = [8308179143, 5085250851]
 API_TOKEN = "Rk5CRTSGcX9fh1WHeIVxYViVlEhaUmSDXG1Qe1dOc2ZykmZGiw=="
 API_URL = "http://51.77.216.195/crapi/dgroup/viewstats"
 
-# Group ID
+# Group ID (OTP Forwarding)
 GROUP_ID = -1003472422744
+
+# =================================================
 
 # লগিং
 logging.basicConfig(level=logging.INFO)
@@ -48,24 +51,19 @@ def safe_print(text):
     except UnicodeEncodeError:
         print(text.encode('utf-8', errors='ignore').decode('utf-8'))
 
-# --- সেফ কলব্যাক অ্যানসার (NEW FIX) ---
+# --- সেফ কলব্যাক ---
 async def safe_answer(callback: types.CallbackQuery, text: str = None, alert: bool = False):
     try:
-        if text:
-            await callback.answer(text, show_alert=alert)
-        else:
-            await callback.answer()
-    except TelegramBadRequest:
-        # যদি কুয়েরি পুরনো হয়ে যায়, ইগনোর করবে (এরর দেবে না)
-        pass
-    except Exception as e:
-        safe_print(f"Callback Answer Error: {e}")
+        if text: await callback.answer(text, show_alert=alert)
+        else: await callback.answer()
+    except: pass
 
 # --- ডাটাবেস সেটআপ ---
 def init_db():
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
     
+    # Countries Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS countries (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -73,6 +71,7 @@ def init_db():
         )
     """)
     
+    # Numbers Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS numbers (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -82,9 +81,19 @@ def init_db():
         )
     """)
     
+    # Users Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY
+        )
+    """)
+
+    # Channels Table (New)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS channels (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id TEXT UNIQUE,
+            invite_link TEXT
         )
     """)
     
@@ -98,24 +107,54 @@ class AdminStates(StatesGroup):
     waiting_country_name = State()
     waiting_number_input = State()
     waiting_broadcast_msg = State()
+    waiting_channel_id = State()   # For adding channel
+    waiting_channel_link = State() # For adding channel link
     last_msg_id = State()
 
-# --- API চেক ফাংশন ---
+# --- চ্যানেল জয়েন চেকার (DYNAMIC) ---
+async def check_subscription(user_id):
+    if user_id in ADMIN_IDS: return True
+    
+    conn = sqlite3.connect("bot_database.db")
+    channels = conn.cursor().execute("SELECT chat_id FROM channels").fetchall()
+    conn.close()
+    
+    if not channels: return True # কোনো চ্যানেল সেট করা না থাকলে ফ্রি এক্সেস
+    
+    not_joined = False
+    for ch in channels:
+        chat_id = ch[0]
+        try:
+            member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+            if member.status not in [ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR]:
+                not_joined = True
+                break
+        except Exception as e:
+            safe_print(f"Check Sub Error (Bot Admin?): {e}")
+            # বট অ্যাডমিন না থাকলে ইগনোর করবে, যাতে ইউজার আটকে না যায়
+            pass
+            
+    return not not_joined
+
+# --- জয়েন রিকোয়েস্ট কিবোর্ড (DYNAMIC) ---
+def get_join_keyboard():
+    conn = sqlite3.connect("bot_database.db")
+    channels = conn.cursor().execute("SELECT invite_link FROM channels").fetchall()
+    conn.close()
+    
+    kb = []
+    for i, ch in enumerate(channels):
+        kb.append([InlineKeyboardButton(text=f"📢 Join Channel {i+1}", url=ch[0])])
+    
+    kb.append([InlineKeyboardButton(text="✅ VERIFY JOIN", callback_data="verify_join")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+# --- API ফাংশন ---
 async def check_otp_api(phone_number):
     clean_number = ''.join(filter(str.isdigit, str(phone_number)))
-    
-    params = {}
-    params['token'] = API_TOKEN
-    params['filternum'] = clean_number
-    params['records'] = 50
-    
-    # ফিক্স: ব্রাউজার হেডার্স
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-    }
-    
-    timeout = aiohttp.ClientTimeout(total=10) # 10 sec timeout
-    
+    params = {'token': API_TOKEN, 'filternum': clean_number, 'records': 50}
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0.4472.124 Safari/537.36"}
+    timeout = aiohttp.ClientTimeout(total=10)
     try:
         async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False), timeout=timeout) as session:
             async with session.get(API_URL, params=params, headers=headers) as resp:
@@ -123,23 +162,17 @@ async def check_otp_api(phone_number):
                     data = await resp.json()
                     if data.get("status") == "success" and data.get("data"):
                         try:
-                            # নতুন মেসেজ আগে
-                            sorted_data = sorted(data["data"], key=lambda x: x['dt'], reverse=True)
-                            return sorted_data
-                        except:
-                            return data["data"]
-                else:
-                    safe_print(f"API Error Status: {resp.status}")
-    except Exception as e:
-        safe_print(f"API Connection Error: {e}")
-        
+                            return sorted(data["data"], key=lambda x: x['dt'], reverse=True)
+                        except: return data["data"]
+    except: pass
     return []
 
-# --- কিবোর্ড ---
+# --- অ্যাডমিন কিবোর্ড (আপডেটেড) ---
 def get_admin_reply_keyboard():
     kb = [
         [KeyboardButton(text="ADD COUNTRY"), KeyboardButton(text="REMOVE COUNTRY")],
-        [KeyboardButton(text="ADD NUMBER"), KeyboardButton(text="📢 BROADCAST")]
+        [KeyboardButton(text="ADD NUMBER"), KeyboardButton(text="📢 BROADCAST")],
+        [KeyboardButton(text="ADD CHANNEL"), KeyboardButton(text="REMOVE CHANNEL")] # New Buttons
     ]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
@@ -148,80 +181,157 @@ def get_country_inline_keyboard():
     cursor = conn.cursor()
     cursor.execute("SELECT id, name FROM countries")
     countries = cursor.fetchall()
-    conn.close()
     buttons = []
     for c_id, c_name in countries:
-        buttons.append([InlineKeyboardButton(text=c_name, callback_data=f"buy_{c_id}_{c_name}")])
+        cnt = cursor.execute("SELECT COUNT(*) FROM numbers WHERE country_id = ? AND status = 0", (c_id,)).fetchone()[0]
+        buttons.append([InlineKeyboardButton(text=f"{c_name} ({cnt})", callback_data=f"buy_{c_id}_{c_name}")])
+    conn.close()
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-# --- হ্যান্ডলারস ---
+# --- START & VERIFY HANDLERS ---
 
-@dp.message(Command("start"))
+@dp.message(Command("start"), F.chat.type == ChatType.PRIVATE)
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
     
     conn = sqlite3.connect("bot_database.db")
-    cursor = conn.cursor()
     try:
-        cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+        conn.cursor().execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
         conn.commit()
     except: pass
     conn.close()
 
     if user_id in user_tasks:
         task = user_tasks[user_id]
-        if not task.done():
-            task.cancel()
+        if not task.done(): task.cancel()
         del user_tasks[user_id]
+
+    # সাবস্ক্রিপশন চেক
+    if not await check_subscription(user_id):
+        await message.answer("⚠️ **বট ব্যবহার করতে নিচের চ্যানেলগুলোতে জয়েন করুন:**", reply_markup=get_join_keyboard())
+        return
 
     if user_id in ADMIN_IDS:
         await message.answer("👑 স্বাগতম অ্যাডমিন!", reply_markup=get_admin_reply_keyboard())
         kb = get_country_inline_keyboard()
-        if kb.inline_keyboard: await message.answer("User Demo View:", reply_markup=kb)
-        else: await message.answer("⚠️ বর্তমানে কোনো দেশ অ্যাড করা নেই।")
+        if kb.inline_keyboard: await message.answer("User View:", reply_markup=kb)
+        else: await message.answer("⚠️ বর্তমানে কোনো দেশ নেই।")
     else:
         kb = get_country_inline_keyboard()
         if not kb.inline_keyboard: await message.answer("বর্তমানে কোনো সার্ভিস নেই।", reply_markup=ReplyKeyboardRemove())
-        else: await message.answer("স্বাগতম! নিচে দেওয়া দেশগুলো থেকে সিলেক্ট করুন:", reply_markup=kb)
+        else: await message.answer("দেশ সিলেক্ট করুন:", reply_markup=kb)
+
+@dp.callback_query(F.data == "verify_join")
+async def verify_join_handler(callback: types.CallbackQuery, state: FSMContext):
+    if await check_subscription(callback.from_user.id):
+        await safe_answer(callback, text="✅ Verified!")
+        await callback.message.delete()
+        await cmd_start(callback.message, state)
+    else:
+        await safe_answer(callback, text="❌ আপনি জয়েন করেননি!", alert=True)
+
+# --- USER FLOW ---
 
 @dp.callback_query(F.data == "show_country_list")
 async def show_country_list_handler(callback: types.CallbackQuery, state: FSMContext):
-    # ফিক্স: প্রথমেই কলব্যাক অ্যানসার করা
     await safe_answer(callback)
-    
     user_id = callback.from_user.id
     if user_id in user_tasks:
         user_tasks[user_id].cancel()
         del user_tasks[user_id]
     kb = get_country_inline_keyboard()
-    if not kb.inline_keyboard: await callback.message.edit_text("বর্তমানে কোনো সার্ভিস নেই।")
-    else: await callback.message.edit_text("স্বাগতম! নিচে দেওয়া দেশগুলো থেকে সিলেক্ট করুন:", reply_markup=kb)
+    if not kb.inline_keyboard: await callback.message.edit_text("সার্ভিস নেই।")
+    else: await callback.message.edit_text("দেশ সিলেক্ট করুন:", reply_markup=kb)
 
 @dp.callback_query(F.data == "cancel_op")
 async def cancel_operation(callback: types.CallbackQuery, state: FSMContext):
-    await safe_answer(callback, text="Operation Cancelled")
-    
+    await safe_answer(callback)
     user_id = callback.from_user.id
     if user_id in user_tasks:
         user_tasks[user_id].cancel()
         del user_tasks[user_id]
     await state.clear()
     await callback.message.delete()
-    if user_id not in ADMIN_IDS: await cmd_start(callback.message, state)
+    await cmd_start(callback.message, state)
 
 @dp.callback_query(F.data == "back_home")
 async def back_home(callback: types.CallbackQuery, state: FSMContext):
     await cancel_operation(callback, state)
 
-# --- ADMIN ACTIONS ---
+# --- ADMIN ACTIONS (CHANNEL MANAGEMENT) ---
 
-@dp.message(F.text == "📢 BROADCAST", F.from_user.id.in_(ADMIN_IDS))
-async def admin_broadcast_start(message: types.Message, state: FSMContext):
+# 1. ADD CHANNEL
+@dp.message(F.text == "ADD CHANNEL", F.from_user.id.in_(ADMIN_IDS), F.chat.type == ChatType.PRIVATE)
+async def admin_add_channel_start(message: types.Message, state: FSMContext):
     msg = await message.answer(
-        "ব্রডকাস্ট মেসেজ লিখুন:", 
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Cancel", callback_data="back_home")]])
+        "চ্যানেলের Username বা ID দিন (যেমন: @mychannel বা -100...):\n\n⚠️ **নোট:** বটকে অবশ্যই ওই চ্যানেলে অ্যাডমিন বানাবেন।", 
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Cancel", callback_data="back_home")]])
     )
+    await state.update_data(last_msg_id=msg.message_id)
+    await state.set_state(AdminStates.waiting_channel_id)
+
+@dp.message(AdminStates.waiting_channel_id, F.from_user.id.in_(ADMIN_IDS))
+async def admin_add_channel_id(message: types.Message, state: FSMContext):
+    chat_id = message.text.strip()
+    await state.update_data(chat_id=chat_id)
+    
+    data = await state.get_data()
+    try: await bot.edit_message_text(chat_id=message.chat.id, message_id=data.get("last_msg_id"), text=f"ID: {chat_id}\nএবার Invite Link দিন:")
+    except: await message.answer("এবার Invite Link দিন:")
+    
+    await message.delete()
+    await state.set_state(AdminStates.waiting_channel_link)
+
+@dp.message(AdminStates.waiting_channel_link, F.from_user.id.in_(ADMIN_IDS))
+async def admin_add_channel_save(message: types.Message, state: FSMContext):
+    link = message.text.strip()
+    data = await state.get_data()
+    chat_id = data.get("chat_id")
+    
+    conn = sqlite3.connect("bot_database.db")
+    try:
+        conn.cursor().execute("INSERT INTO channels (chat_id, invite_link) VALUES (?, ?)", (chat_id, link))
+        conn.commit()
+        res = f"✅ চ্যানেল অ্যাড হয়েছে!\nID: {chat_id}"
+    except: res = "❌ এই চ্যানেলটি আগেই অ্যাড করা আছে।"
+    conn.close()
+    
+    await message.delete()
+    try: await bot.edit_message_text(chat_id=message.chat.id, message_id=data.get("last_msg_id"), text=res)
+    except: await message.answer(res)
+    await state.clear()
+
+# 2. REMOVE CHANNEL
+@dp.message(F.text == "REMOVE CHANNEL", F.from_user.id.in_(ADMIN_IDS), F.chat.type == ChatType.PRIVATE)
+async def admin_rem_channel_start(message: types.Message):
+    conn = sqlite3.connect("bot_database.db")
+    channels = conn.cursor().execute("SELECT id, chat_id FROM channels").fetchall()
+    conn.close()
+    
+    if not channels: await message.answer("কোনো চ্যানেল নেই!")
+    else:
+        btns = [[InlineKeyboardButton(text=f"❌ {ch[1]}", callback_data=f"del_ch_{ch[0]}")] for ch in channels]
+        btns.append([InlineKeyboardButton(text="Cancel", callback_data="back_home")])
+        await message.answer("চ্যানেল রিমুভ করুন:", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
+
+@dp.callback_query(F.data.startswith("del_ch_"))
+async def delete_channel_action(callback: types.CallbackQuery):
+    await safe_answer(callback)
+    if callback.from_user.id not in ADMIN_IDS: return
+    
+    ch_id = callback.data.split("_")[2]
+    conn = sqlite3.connect("bot_database.db")
+    conn.cursor().execute("DELETE FROM channels WHERE id = ?", (ch_id,))
+    conn.commit()
+    conn.close()
+    await callback.message.edit_text("✅ চ্যানেল রিমুভ করা হয়েছে।")
+
+# --- OTHER ADMIN ACTIONS ---
+
+@dp.message(F.text == "📢 BROADCAST", F.from_user.id.in_(ADMIN_IDS), F.chat.type == ChatType.PRIVATE)
+async def admin_broadcast_start(message: types.Message, state: FSMContext):
+    msg = await message.answer("মেসেজ লিখুন:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Cancel", callback_data="back_home")]]))
     await state.update_data(last_msg_id=msg.message_id)
     await state.set_state(AdminStates.waiting_broadcast_msg)
 
@@ -231,23 +341,20 @@ async def admin_broadcast_send(message: types.Message, state: FSMContext):
     conn = sqlite3.connect("bot_database.db")
     users = conn.cursor().execute("SELECT user_id FROM users").fetchall()
     conn.close()
-    
-    count = 0
+    cnt = 0
     sts = await message.answer("🚀 Sending...")
-    
     for u in users:
         try:
             await bot.send_message(u[0], text)
-            count += 1
+            cnt += 1
             await asyncio.sleep(0.05)
         except: pass
-    await sts.edit_text(f"✅ Sent to {count} users.")
+    await sts.edit_text(f"✅ Sent to {cnt} users.")
     await state.clear()
 
-@dp.message(F.text == "ADD COUNTRY", F.from_user.id.in_(ADMIN_IDS))
+@dp.message(F.text == "ADD COUNTRY", F.from_user.id.in_(ADMIN_IDS), F.chat.type == ChatType.PRIVATE)
 async def admin_add_country_start(message: types.Message, state: FSMContext):
-    msg = await message.answer("Country নাম:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Cancel", callback_data="back_home")]])
-    )
+    msg = await message.answer("নাম লিখুন:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Cancel", callback_data="back_home")]]))
     await state.update_data(last_msg_id=msg.message_id)
     await state.set_state(AdminStates.waiting_country_name)
 
@@ -255,33 +362,30 @@ async def admin_add_country_start(message: types.Message, state: FSMContext):
 async def save_country_name(message: types.Message, state: FSMContext):
     name = message.text.strip()
     data = await state.get_data()
-    last_msg_id = data.get("last_msg_id")
     conn = sqlite3.connect("bot_database.db")
     try:
         conn.cursor().execute("INSERT INTO countries (name) VALUES (?)", (name,))
         conn.commit()
         res = f"✅ '{name}' Added."
-    except: res = f"❌ '{name}' Exists."
+    except: res = f"❌ Exists."
     conn.close()
     try: await message.delete()
     except: pass
-    if last_msg_id:
-        try: await bot.edit_message_text(chat_id=message.chat.id, message_id=last_msg_id, text=res)
+    if data.get("last_msg_id"):
+        try: await bot.edit_message_text(chat_id=message.chat.id, message_id=data.get("last_msg_id"), text=res)
         except: await message.answer(res)
     await state.clear()
 
-@dp.message(F.text == "REMOVE COUNTRY", F.from_user.id.in_(ADMIN_IDS))
+@dp.message(F.text == "REMOVE COUNTRY", F.from_user.id.in_(ADMIN_IDS), F.chat.type == ChatType.PRIVATE)
 async def admin_rem_country_start(message: types.Message):
     conn = sqlite3.connect("bot_database.db")
     countries = conn.cursor().execute("SELECT id, name FROM countries").fetchall()
     conn.close()
     if not countries: await message.answer("Empty!")
     else:
-        buttons = []
-        for c in countries:
-            buttons.append([InlineKeyboardButton(text=f"❌ {c[1]}", callback_data=f"del_c_{c[0]}")])
-        buttons.append([InlineKeyboardButton(text="Cancel", callback_data="back_home")])
-        await message.answer("Select to Remove:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+        btns = [[InlineKeyboardButton(text=f"❌ {c[1]}", callback_data=f"del_c_{c[0]}")] for c in countries]
+        btns.append([InlineKeyboardButton(text="Cancel", callback_data="back_home")])
+        await message.answer("Remove:", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
 
 @dp.callback_query(F.data.startswith("del_c_"))
 async def delete_country_action(callback: types.CallbackQuery):
@@ -295,18 +399,16 @@ async def delete_country_action(callback: types.CallbackQuery):
     conn.close()
     await callback.message.edit_text("✅ Removed.")
 
-@dp.message(F.text == "ADD NUMBER", F.from_user.id.in_(ADMIN_IDS))
+@dp.message(F.text == "ADD NUMBER", F.from_user.id.in_(ADMIN_IDS), F.chat.type == ChatType.PRIVATE)
 async def admin_add_number_start(message: types.Message):
     conn = sqlite3.connect("bot_database.db")
     countries = conn.cursor().execute("SELECT id, name FROM countries").fetchall()
     conn.close()
     if not countries: await message.answer("Add Country First!")
     else:
-        buttons = []
-        for c in countries:
-            buttons.append([InlineKeyboardButton(text=c[1], callback_data=f"sel_cn_{c[0]}_{c[1]}")])
-        buttons.append([InlineKeyboardButton(text="Cancel", callback_data="back_home")])
-        await message.answer("Select Country:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+        btns = [[InlineKeyboardButton(text=c[1], callback_data=f"sel_cn_{c[0]}_{c[1]}")] for c in countries]
+        btns.append([InlineKeyboardButton(text="Cancel", callback_data="back_home")])
+        await message.answer("Select Country:", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
 
 @dp.callback_query(F.data.startswith("sel_cn_"))
 async def select_input_method(callback: types.CallbackQuery, state: FSMContext):
@@ -314,8 +416,8 @@ async def select_input_method(callback: types.CallbackQuery, state: FSMContext):
     if callback.from_user.id not in ADMIN_IDS: return
     part = callback.data.split("_")
     await state.update_data(country_id=part[2], country_name=part[3])
-    buttons = [[InlineKeyboardButton(text="📂 File", callback_data="in_file")], [InlineKeyboardButton(text="✍️ Written", callback_data="in_text")], [InlineKeyboardButton(text="🔙 Cancel", callback_data="back_home")]]
-    msg = await callback.message.edit_text(f"Selected: {part[3]}\nSelect Method:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    btns = [[InlineKeyboardButton(text="📂 File", callback_data="in_file")], [InlineKeyboardButton(text="✍️ Written", callback_data="in_text")], [InlineKeyboardButton(text="🔙 Cancel", callback_data="back_home")]]
+    msg = await callback.message.edit_text(f"Selected: {part[3]}\nMethod:", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
     await state.update_data(last_msg_id=msg.message_id)
 
 @dp.callback_query(F.data.in_({"in_file", "in_text"}))
@@ -332,49 +434,46 @@ async def request_number_input(callback: types.CallbackQuery, state: FSMContext)
 @dp.message(AdminStates.waiting_number_input, F.from_user.id.in_(ADMIN_IDS))
 async def process_numbers(message: types.Message, state: FSMContext):
     data = await state.get_data()
-    c_id = data['country_id']
-    mode = data['mode']
-    last_msg_id = data.get("last_msg_id")
     content = ""
-    if mode == "in_file" and message.document:
+    if data['mode'] == "in_file" and message.document:
         file = await bot.get_file(message.document.file_id)
         downloaded = await bot.download_file(file.file_path)
         content = downloaded.read().decode('utf-8')
-    elif mode == "in_text" and message.text: content = message.text
+    elif data['mode'] == "in_text" and message.text: content = message.text
     else: 
         try: await message.delete()
         except: pass
         return
     
-    raw_numbers = re.split(r'[,\n\r]+', content)
-    valid_numbers = [n.strip() for n in raw_numbers if n.strip()]
-    
+    nums = [n.strip() for n in re.split(r'[,\n\r]+', content) if n.strip()]
     conn = sqlite3.connect("bot_database.db")
     added = 0
-    for num in valid_numbers:
+    for n in nums:
         try:
-            conn.cursor().execute("INSERT INTO numbers (country_id, number, status) VALUES (?, ?, 0)", (c_id, num))
+            conn.cursor().execute("INSERT INTO numbers (country_id, number, status) VALUES (?, ?, 0)", (data['country_id'], n))
             added += 1
-        except sqlite3.IntegrityError:
-            conn.cursor().execute("UPDATE numbers SET status = 0 WHERE number = ? AND country_id = ?", (num, c_id))
+        except:
+            conn.cursor().execute("UPDATE numbers SET status = 0 WHERE number = ? AND country_id = ?", (n, data['country_id']))
             added += 1
     conn.commit()
     conn.close()
     try: await message.delete()
     except: pass
-    res_text = f"✅ Added {added} numbers."
-    if last_msg_id:
-        try: await bot.edit_message_text(chat_id=message.chat.id, message_id=last_msg_id, text=res_text)
-        except: await message.answer(res_text)
+    res = f"✅ Added {added} numbers."
+    if data.get("last_msg_id"):
+        try: await bot.edit_message_text(chat_id=message.chat.id, message_id=data.get("last_msg_id"), text=res)
+        except: await message.answer(res)
     await state.clear()
 
 @dp.callback_query(F.data.startswith("buy_"))
 async def user_buy_number(callback: types.CallbackQuery):
     user_id = callback.from_user.id
-    
-    # FIX: প্রথমেই অ্যানসার দেওয়া যাতে timeout না হয়
     await safe_answer(callback)
     
+    if not await check_subscription(user_id):
+        await safe_answer(callback, text="Join Channels First!", alert=True)
+        return
+
     if user_id in user_tasks:
         task = user_tasks[user_id]
         if not task.done():
@@ -383,10 +482,8 @@ async def user_buy_number(callback: types.CallbackQuery):
         del user_tasks[user_id]
     
     part = callback.data.split("_")
-    c_id, c_name = part[1], part[2]
-    
     conn = sqlite3.connect("bot_database.db")
-    res = conn.cursor().execute("SELECT number FROM numbers WHERE country_id = ? AND status = 0 LIMIT 1", (c_id,)).fetchone()
+    res = conn.cursor().execute("SELECT number FROM numbers WHERE country_id = ? AND status = 0 LIMIT 1", (part[1],)).fetchone()
     
     if not res:
         conn.close()
@@ -397,68 +494,53 @@ async def user_buy_number(callback: types.CallbackQuery):
     conn.commit()
     conn.close()
     
-    text = f"🌎 {c_name} WS Number Assigned:\n<code>+{phone}</code>\n\nWaiting for OTP..."
-    kb = [[InlineKeyboardButton(text="CHANGE NUMBER", callback_data=f"buy_{c_id}_{c_name}")], [InlineKeyboardButton(text="CHANGE COUNTRY", callback_data="show_country_list")], [InlineKeyboardButton(text="CANCEL OPERATION", callback_data="cancel_op")]]
+    text = f"🌎 {part[2]} WS Number Assigned:\n<code>+{phone}</code>\n\nWaiting for OTP..."
+    kb = [[InlineKeyboardButton(text="CHANGE NUMBER", callback_data=f"buy_{part[1]}_{part[2]}")], [InlineKeyboardButton(text="CHANGE COUNTRY", callback_data="show_country_list")], [InlineKeyboardButton(text="CANCEL OPERATION", callback_data="cancel_op")]]
     sent_msg = await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
     
-    safe_print(f"Task Started: {phone}")
-    user_tasks[user_id] = asyncio.create_task(otp_checker_task(bot, callback.message.chat.id, phone, c_name, sent_msg.message_id))
+    safe_print(f"Started: {phone}")
+    user_tasks[user_id] = asyncio.create_task(otp_checker_task(bot, callback.message.chat.id, phone, part[2], sent_msg.message_id))
 
-# --- OTP CHECKER ---
 async def otp_checker_task(bot: Bot, chat_id: int, phone_number: str, country_name: str, message_id: int):
     last_dt = None
-    for _ in range(120): # 10 minutes
+    for _ in range(120):
         try:
             await asyncio.sleep(5)
             msgs = await check_otp_api(phone_number)
-            
             if msgs:
                 latest = msgs[0]
-                
                 if last_dt is None or latest.get("dt") != last_dt:
                     last_dt = latest.get("dt")
                     msg_body = latest.get("message", "")
                     
-                    # Service
-                    service_name = latest.get("cli", "Service")
-                    service_name = service_name.capitalize() if service_name and service_name != "null" else "Unknown"
+                    svc = latest.get("cli", "Service")
+                    svc = svc.capitalize() if svc and svc != "null" else "Unknown"
                     
-                    # Universal Regex
+                    # Universal Regex for 4-8 digits (Matches XXX-XXX, XXX XXX, XXXXXX)
                     otp_match = re.search(r'(?:\d{3}[-\s]\d{3})|(?<!\d)\d{4,8}(?!\d)', msg_body)
                     otp = otp_match.group(0) if otp_match else "N/A"
                     
-                    cur_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    ctime = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     masked = f"{phone_number[:4]}***{phone_number[-4:]}" if len(phone_number) > 7 else phone_number
                     
-                    user_txt = f"🌎 Country : {country_name}\n🔢 Number : <code>{phone_number}</code>\n🔑 OTP : <code>{otp}</code>\n💸 Reward: 🔥"
-                    group_txt = f"✅ {country_name} {service_name} OTP Received!\n━━━━━━━━━━━━━━━━━━━━\n📱 Number: <code>{masked}</code>\n🌍 Country: {country_name}\n⚙️ Service: {service_name}\n🔒 OTP Code: <code>{otp}</code>\n⏳ Time: {cur_time}\n━━━━━━━━━━━━━━━━━━━━\nMessage:\n{msg_body}"
+                    utxt = f"🌎 Country : {country_name}\n🔢 Number : <code>{phone_number}</code>\n🔑 OTP : <code>{otp}</code>\n💸 Reward: 🔥"
+                    gtxt = f"✅ {country_name} {svc} OTP Received!\n━━━━━━━━━━━━━━━━━━━━\n📱 Number: <code>{masked}</code>\n🌍 Country: {country_name}\n⚙️ Service: {svc}\n🔒 OTP Code: <code>{otp}</code>\n⏳ Time: {ctime}\n━━━━━━━━━━━━━━━━━━━━\nMessage:\n{msg_body}"
                     
-                    safe_print(f"OTP Found: {otp} for {phone_number}")
-                    
-                    try: await bot.send_message(chat_id, user_txt)
-                    except Exception as e: safe_print(f"User Send Error: {e}")
-                    
-                    try: await bot.send_message(GROUP_ID, group_txt)
-                    except Exception as e: safe_print(f"Group Send Error: {e}")
+                    safe_print(f"OTP: {otp}")
+                    try: await bot.send_message(chat_id, utxt)
+                    except: pass
+                    try: await bot.send_message(GROUP_ID, gtxt)
+                    except: pass
+        except asyncio.CancelledError: break
+        except: await asyncio.sleep(5)
 
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            safe_print(f"Loop Error: {e}")
-            await asyncio.sleep(5)
-
-# --- WEB SERVER ---
-async def web_handler(request):
-    return web.Response(text="Bot is running!")
-
+async def web_handler(request): return web.Response(text="Bot is running!")
 async def start_web_server():
     app = web.Application()
     app.router.add_get('/', web_handler)
     runner = web.AppRunner(app)
     await runner.setup()
-    port = int(os.environ.get("PORT", 8080))
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
+    await web.TCPSite(runner, '0.0.0.0', int(os.environ.get("PORT", 8080))).start()
 
 async def main():
     safe_print("Bot is running...")
