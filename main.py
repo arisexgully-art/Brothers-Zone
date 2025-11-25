@@ -86,32 +86,40 @@ class AdminStates(StatesGroup):
     waiting_broadcast_msg = State()
     last_msg_id = State()
 
-# --- API চেক ফাংশন ---
+# --- API চেক ফাংশন (POWERFUL VERSION) ---
 async def check_otp_api(phone_number):
-    # শুধুমাত্র সংখ্যাগুলো বের করে আনা হচ্ছে যাতে API ফিল্টার কাজ করে
     clean_number = ''.join(filter(str.isdigit, str(phone_number)))
     
-    params = {}
-    params['token'] = API_TOKEN
-    params['filternum'] = clean_number
-    params['records'] = 50
+    params = {
+        "token": API_TOKEN,
+        "filternum": clean_number,
+        "records": 50
+    }
+    
+    # ব্রাউজার হেডার্স (যাতে ব্লক না হয়)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    }
+    
+    # টাইমআউট সেট করা (১০ সেকেন্ড)
+    timeout = aiohttp.ClientTimeout(total=10)
     
     try:
-        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False)) as session:
-            async with session.get(API_URL, params=params) as resp:
+        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False), timeout=timeout) as session:
+            async with session.get(API_URL, params=params, headers=headers) as resp:
                 if resp.status == 200:
-                    data = await resp.json()
-                    if data.get("status") == "success" and data.get("data"):
-                        # নতুন মেসেজ সবার আগে পাওয়ার জন্য তারিখ অনুযায়ী সর্ট করা হচ্ছে
-                        try:
+                    try:
+                        data = await resp.json()
+                        if data.get("status") == "success" and data.get("data"):
+                            # তারিখ অনুযায়ী সর্ট করা (নতুন মেসেজ আগে)
                             sorted_data = sorted(data["data"], key=lambda x: x['dt'], reverse=True)
                             return sorted_data
-                        except:
-                            return data["data"]
+                    except Exception as json_err:
+                        safe_print(f"JSON Error: {json_err}")
                 else:
-                    safe_print(f"API Error Status: {resp.status}")
+                    safe_print(f"API Status: {resp.status}")
     except Exception as e:
-        safe_print(f"API Connection Error: {e}")
+        safe_print(f"Connection Error: {e}")
         
     return []
 
@@ -149,7 +157,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
     except: pass
     conn.close()
 
-    # আগের টাস্ক ক্যানসেল করা
+    # ফিক্স: স্টার্ট দিলে আগের টাস্ক ক্যানসেল হবে
     if user_id in user_tasks:
         task = user_tasks[user_id]
         if not task.done():
@@ -223,7 +231,8 @@ async def admin_broadcast_send(message: types.Message, state: FSMContext):
 
 @dp.message(F.text == "ADD COUNTRY", F.from_user.id.in_(ADMIN_IDS))
 async def admin_add_country_start(message: types.Message, state: FSMContext):
-    msg = await message.answer("Country নাম:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Cancel", callback_data="back_home")]]))
+    msg = await message.answer("Country নাম:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Cancel", callback_data="back_home")]])
+    )
     await state.update_data(last_msg_id=msg.message_id)
     await state.set_state(AdminStates.waiting_country_name)
 
@@ -346,8 +355,14 @@ async def user_buy_number(callback: types.CallbackQuery):
     part = callback.data.split("_")
     c_id, c_name = part[1], part[2]
     user_id = callback.from_user.id
+    
+    # ফিক্স: আগের টাস্ক নিশ্চিতভাবে ক্যানসেল করা
     if user_id in user_tasks:
-        user_tasks[user_id].cancel()
+        task = user_tasks[user_id]
+        if not task.done():
+            task.cancel()
+            await asyncio.sleep(0.5) # একটু সময় দেওয়া
+        del user_tasks[user_id]
     
     conn = sqlite3.connect("bot_database.db")
     res = conn.cursor().execute("SELECT number FROM numbers WHERE country_id = ? AND status = 0 LIMIT 1", (c_id,)).fetchone()
@@ -371,7 +386,12 @@ async def user_buy_number(callback: types.CallbackQuery):
 # --- OTP CHECKER ---
 async def otp_checker_task(bot: Bot, chat_id: int, phone_number: str, country_name: str, message_id: int):
     last_dt = None
-    # লুপ যাতে ক্র্যাশ না করে তাই Try-Except
+    
+    # লুপের শুরুতে আমরা API চেক করে last_dt সেট করব যাতে পুরনো মেসেজ না যায়
+    # কিন্তু ইউজার যদি নতুন কেনে এবং সেখানে অলরেডি মেসেজ থাকে, সেটা তাকে দেওয়া উচিত কিনা?
+    # সাধারণত প্যানেল থেকে নতুন মেসেজ আসলে সেটা দেওয়াই ভালো।
+    # আমরা প্রথম চেকে last_dt None রাখি যাতে যে কোনো মেসেজ আসলেই সেটা দেখায়।
+    
     for _ in range(120): # 10 minutes loop
         try:
             await asyncio.sleep(5)
@@ -380,6 +400,7 @@ async def otp_checker_task(bot: Bot, chat_id: int, phone_number: str, country_na
             if msgs:
                 latest = msgs[0]
                 
+                # নতুন মেসেজ চেক
                 if last_dt is None or latest.get("dt") != last_dt:
                     last_dt = latest.get("dt")
                     msg_body = latest.get("message", "")
@@ -388,10 +409,8 @@ async def otp_checker_task(bot: Bot, chat_id: int, phone_number: str, country_na
                     service_name = latest.get("cli", "Service")
                     service_name = service_name.capitalize() if service_name and service_name != "null" else "Unknown"
                     
-                    # 2. ইউনিভার্সাল Regex
-                    # চীনা, আরবি বা অন্য ভাষায় কোড বের করার জন্য
-                    # প্যাটার্ন ১: 123-456 বা 123 456
-                    # প্যাটার্ন ২: 4-8 ডিজিটের সংখ্যা যা অন্য কোনো ডিজিটের সাথে লেগে নেই
+                    # 2. ইউনিভার্সাল Regex (Universal Regex)
+                    # Chinese, Arabic, English Support
                     otp_match = re.search(r'(?:\d{3}[-\s]\d{3})|(?<!\d)\d{4,8}(?!\d)', msg_body)
                     otp = otp_match.group(0) if otp_match else "N/A"
                     
@@ -410,6 +429,7 @@ async def otp_checker_task(bot: Bot, chat_id: int, phone_number: str, country_na
                     except Exception as e: safe_print(f"Group Send Error: {e}")
 
         except asyncio.CancelledError:
+            safe_print(f"Stopping Task for {phone_number}")
             break
         except Exception as e:
             safe_print(f"Loop Error: {e}")
