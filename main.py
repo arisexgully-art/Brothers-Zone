@@ -6,6 +6,7 @@ import re
 import os
 import sys
 import hashlib
+import html
 from datetime import datetime
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
@@ -28,12 +29,6 @@ from aiogram.types import (
 BOT_TOKEN = "8070506568:AAE6mUi2wcXMRTnZRwHUut66Nlu1NQC8Opo"
 ADMIN_IDS = [8308179143, 5085250851]
 
-# Channel Config
-CHANNEL_1_ID = "@your_first_channel" 
-CHANNEL_1_LINK = "https://t.me/your_first_channel"
-CHANNEL_2_ID = "@your_second_channel"
-CHANNEL_2_LINK = "https://t.me/your_second_channel"
-
 # API Settings
 API_TOKEN = "Rk5CRTSGcX9fh1WHeIVxYViVlEhaUmSDXG1Qe1dOc2ZykmZGiw=="
 API_URL = "http://51.77.216.195/crapi/dgroup/viewstats"
@@ -47,6 +42,7 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
+user_tasks = {}
 
 # --- Helper Functions ---
 def safe_print(text):
@@ -59,7 +55,7 @@ async def safe_answer(callback: types.CallbackQuery, text: str = None, alert: bo
         else: await callback.answer()
     except: pass
 
-# --- DATABASE SETUP (UPDATED) ---
+# --- DATABASE SETUP ---
 def init_db():
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
@@ -71,7 +67,7 @@ def init_db():
         )
     """)
     
-    # Updated Numbers Table: Added 'assigned_to' column
+    # Numbers Table (status: 0=Free, 1=Busy/Assigned, 2=Used/Dead)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS numbers (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -96,7 +92,6 @@ def init_db():
         )
     """)
 
-    # New Table: To track received SMS and prevent duplicates/misses
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS processed_sms (
             signature TEXT PRIMARY KEY,
@@ -118,13 +113,14 @@ class AdminStates(StatesGroup):
     waiting_channel_link = State()
     last_msg_id = State()
 
-# --- Channel Check ---
+# --- Channel Subscription Check ---
 async def check_subscription(user_id):
     if user_id in ADMIN_IDS: return True
     conn = sqlite3.connect("bot_database.db")
     channels = conn.cursor().execute("SELECT chat_id FROM channels").fetchall()
     conn.close()
     if not channels: return True
+    
     for ch in channels:
         try:
             member = await bot.get_chat_member(chat_id=ch[0], user_id=user_id)
@@ -143,7 +139,7 @@ def get_join_keyboard():
     kb.append([InlineKeyboardButton(text="✅ VERIFY JOIN", callback_data="verify_join")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
-# --- API Function (Robust) ---
+# --- API Function ---
 async def check_otp_api(phone_number):
     clean_number = ''.join(filter(str.isdigit, str(phone_number)))
     params = {'token': API_TOKEN, 'filternum': clean_number, 'records': 50}
@@ -177,6 +173,7 @@ def get_country_inline_keyboard():
     countries = cursor.fetchall()
     buttons = []
     for c_id, c_name in countries:
+        # Only count FREE numbers (status = 0)
         cnt = cursor.execute("SELECT COUNT(*) FROM numbers WHERE country_id = ? AND status = 0", (c_id,)).fetchone()[0]
         buttons.append([InlineKeyboardButton(text=f"{c_name} ({cnt})", callback_data=f"buy_{c_id}_{c_name}")])
     conn.close()
@@ -193,16 +190,14 @@ async def cmd_start(message: types.Message, state: FSMContext):
     try: conn.cursor().execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,)); conn.commit()
     except: pass
     
-    # RESET USER: If user sends /start, unassign their previous numbers to avoid confusion?
-    # Or keep checking? Usually /start means reset.
-    # Let's free up numbers assigned to this user if they haven't received OTP?
-    # For now, we just let the background task handle running numbers.
-    
-    # If user explicitly cancels, we free. Here just menu.
+    # Free up previous numbers for this user if any (Reset)
+    # If user sends /start, we assume they want to restart, so we release old number
+    conn.cursor().execute("UPDATE numbers SET status = 0, assigned_to = NULL WHERE assigned_to = ?", (user_id,))
+    conn.commit()
     conn.close()
 
     if not await check_subscription(user_id):
-        await message.answer("⚠️ **Please join our channels:**", reply_markup=get_join_keyboard())
+        await message.answer("⚠️ **Please join our channels first:**", reply_markup=get_join_keyboard())
         return
 
     if user_id in ADMIN_IDS:
@@ -211,7 +206,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
         await message.answer("User View:", reply_markup=kb if kb.inline_keyboard else None)
     else:
         kb = get_country_inline_keyboard()
-        if not kb.inline_keyboard: await message.answer("Service Unavailable.", reply_markup=ReplyKeyboardRemove())
+        if not kb.inline_keyboard: await message.answer("No services available.", reply_markup=ReplyKeyboardRemove())
         else: await message.answer("Select Country:", reply_markup=kb)
 
 @dp.callback_query(F.data == "verify_join")
@@ -223,7 +218,7 @@ async def verify_join_handler(callback: types.CallbackQuery, state: FSMContext):
     else:
         await safe_answer(callback, text="Join First!", alert=True)
 
-# --- USER FLOW ---
+# --- USER FLOW (ATOMIC ASSIGNMENT) ---
 
 @dp.callback_query(F.data.startswith("buy_"))
 async def user_buy_number(callback: types.CallbackQuery):
@@ -240,53 +235,66 @@ async def user_buy_number(callback: types.CallbackQuery):
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
     
-    # 1. Cancel previous number for this user (Make it free again)
+    # 1. Release previously assigned number (if any)
     cursor.execute("UPDATE numbers SET status = 0, assigned_to = NULL WHERE assigned_to = ?", (user_id,))
-    
-    # 2. Assign new number
-    res = cursor.execute("SELECT number FROM numbers WHERE country_id = ? AND status = 0 LIMIT 1", (c_id,)).fetchone()
-    
-    if not res:
-        conn.commit()
-        conn.close()
-        await safe_answer(callback, text="Stock Empty!", alert=True)
-        return
-        
-    phone = res[0]
-    # Assign specific number to specific user
-    cursor.execute("UPDATE numbers SET status = 1, assigned_to = ? WHERE number = ?", (user_id, phone))
     conn.commit()
+    
+    # 2. ATOMIC ASSIGNMENT LOOP
+    # This ensures 100% uniqueness even with multiple users
+    assigned_phone = None
+    
+    # Try 5 times to get a locked number (handling race conditions)
+    for _ in range(5):
+        # Find a candidate ID
+        row = cursor.execute("SELECT id, number FROM numbers WHERE country_id = ? AND status = 0 LIMIT 1", (c_id,)).fetchone()
+        
+        if not row:
+            break # No numbers available
+            
+        num_id, phone = row
+        
+        # Attempt to lock this specific ID
+        # "status = 0" check in UPDATE clause is the key to atomicity
+        cursor.execute("UPDATE numbers SET status = 1, assigned_to = ? WHERE id = ? AND status = 0", (user_id, num_id))
+        
+        if cursor.rowcount > 0:
+            # Successfully locked!
+            conn.commit()
+            assigned_phone = phone
+            break
+        else:
+            # Someone else grabbed it in the microsecond gap, try next one
+            continue
+            
     conn.close()
     
-    text = f"🌎 {c_name} Assigned:\n<code>+{phone}</code>\n\nWaiting for OTP..."
+    if not assigned_phone:
+        await safe_answer(callback, text="Stock Empty / Busy!", alert=True)
+        return
+    
+    text = f"🌎 {c_name} Assigned:\n<code>+{assigned_phone}</code>\n\nWaiting for OTP..."
     kb = [[InlineKeyboardButton(text="CHANGE NUMBER", callback_data=f"buy_{c_id}_{c_name}")], [InlineKeyboardButton(text="CHANGE COUNTRY", callback_data="show_country_list")], [InlineKeyboardButton(text="CANCEL", callback_data="cancel_op")]]
     
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
-    safe_print(f"Assigned {phone} to User {user_id}")
+    safe_print(f"Assigned {assigned_phone} to User {user_id}")
 
 @dp.callback_query(F.data == "show_country_list")
 async def show_list(callback: types.CallbackQuery, state: FSMContext):
     await safe_answer(callback)
-    
-    # Free up number
     conn = sqlite3.connect("bot_database.db")
     conn.cursor().execute("UPDATE numbers SET status = 0, assigned_to = NULL WHERE assigned_to = ?", (callback.from_user.id,))
     conn.commit()
     conn.close()
-    
     kb = get_country_inline_keyboard()
     await callback.message.edit_text("Select Country:", reply_markup=kb)
 
 @dp.callback_query(F.data == "cancel_op")
 async def cancel_op(callback: types.CallbackQuery, state: FSMContext):
     await safe_answer(callback)
-    
-    # Free up number
     conn = sqlite3.connect("bot_database.db")
     conn.cursor().execute("UPDATE numbers SET status = 0, assigned_to = NULL WHERE assigned_to = ?", (callback.from_user.id,))
     conn.commit()
     conn.close()
-    
     await callback.message.delete()
     await cmd_start(callback.message, state)
 
@@ -294,17 +302,18 @@ async def cancel_op(callback: types.CallbackQuery, state: FSMContext):
 async def go_back(callback: types.CallbackQuery, state: FSMContext):
     await cancel_op(callback, state)
 
-# --- ADMIN HANDLERS (Condensed) ---
-@dp.message(F.text == "ADD CHANNEL", F.from_user.id.in_(ADMIN_IDS))
+# --- ADMIN HANDLERS ---
+
+@dp.message(F.text == "ADD CHANNEL", F.from_user.id.in_(ADMIN_IDS), F.chat.type == ChatType.PRIVATE)
 async def ach(m: types.Message, s: FSMContext):
-    msg=await m.answer("Channel ID:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Cancel", callback_data="back_home")]]))
+    msg=await m.answer("Channel ID/Username:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Cancel", callback_data="back_home")]]))
     await s.update_data(last_msg_id=msg.message_id); await s.set_state(AdminStates.waiting_channel_id)
 
 @dp.message(AdminStates.waiting_channel_id)
 async def ach_id(m: types.Message, s: FSMContext):
     await s.update_data(chat_id=m.text.strip())
     d=await s.get_data()
-    try: await bot.edit_message_text(chat_id=m.chat.id, message_id=d['last_msg_id'], text="Invite Link:")
+    try: await bot.edit_message_text(chat_id=m.chat.id, message_id=d['last_msg_id'], text="Now Send Invite Link:")
     except: await m.answer("Invite Link:")
     await m.delete(); await s.set_state(AdminStates.waiting_channel_link)
 
@@ -312,8 +321,8 @@ async def ach_id(m: types.Message, s: FSMContext):
 async def ach_save(m: types.Message, s: FSMContext):
     d=await s.get_data()
     conn=sqlite3.connect("bot_database.db")
-    try: conn.cursor().execute("INSERT INTO channels (chat_id, invite_link) VALUES (?, ?)", (d['chat_id'], m.text.strip())); conn.commit(); res="✅ Added."
-    except: res="❌ Exists."
+    try: conn.cursor().execute("INSERT INTO channels (chat_id, invite_link) VALUES (?, ?)", (d['chat_id'], m.text.strip())); conn.commit(); res="✅ Channel Added."
+    except: res="❌ Exists/Error."
     conn.close(); await m.delete()
     try: await bot.edit_message_text(chat_id=m.chat.id, message_id=d['last_msg_id'], text=res)
     except: await m.answer(res)
@@ -326,7 +335,7 @@ async def rch(m: types.Message):
     conn.close()
     btns=[[InlineKeyboardButton(text=f"❌ {c[1]}", callback_data=f"del_ch_{c[0]}")] for c in chs]
     btns.append([InlineKeyboardButton(text="Cancel", callback_data="back_home")])
-    await m.answer("Remove:", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
+    await m.answer("Remove Channel:", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
 
 @dp.callback_query(F.data.startswith("del_ch_"))
 async def dch(c: types.CallbackQuery):
@@ -336,10 +345,7 @@ async def dch(c: types.CallbackQuery):
     conn.commit(); conn.close()
     await c.message.edit_text("✅ Removed.")
 
-# (Other Admin handlers like ADD/REMOVE COUNTRY/NUMBER/BROADCAST are assumed same as previous)
-# I'm skipping repeating them to save space, assuming you have them from previous working code. 
-# If you need them again, let me know. I'll just include the polling logic below which is the main fix.
-
+# (Admin Country/Number/Broadcast Handlers)
 @dp.message(F.text == "ADD COUNTRY", F.from_user.id.in_(ADMIN_IDS))
 async def ac_start(m: types.Message, s: FSMContext):
     msg=await m.answer("Country Name:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Cancel", callback_data="back_home")]]))
@@ -419,18 +425,15 @@ async def bc_send(m: types.Message, s: FSMContext):
         except: pass
     await sts.edit_text(f"✅ Sent: {cnt}"); await s.clear()
 
-# ================= CENTRALIZED BACKGROUND TASK (THE FIX) =================
-# This single loop checks all active numbers and routes messages to the correct user.
+# ================= MASTER POLLING LOOP =================
 
 async def master_polling_loop():
     safe_print("🚀 Master Polling Loop Started...")
     while True:
         try:
-            # 1. Get all active numbers assigned to users (status = 1)
+            # 1. Get Active Orders
             conn = sqlite3.connect("bot_database.db")
             active_orders = conn.cursor().execute("SELECT assigned_to, number, country_id FROM numbers WHERE status = 1").fetchall()
-            
-            # Map country_id to country_name for efficiency
             countries = {row[0]: row[1] for row in conn.cursor().execute("SELECT id, name FROM countries").fetchall()}
             conn.close()
 
@@ -438,33 +441,27 @@ async def master_polling_loop():
                 await asyncio.sleep(3)
                 continue
 
-            # 2. Check API for each active number
             for user_id, phone, c_id in active_orders:
                 country_name = countries.get(c_id, "Unknown")
                 
-                # API call
                 msgs = await check_otp_api(phone)
                 
                 if msgs:
-                    for msg in msgs:
-                        # Unique signature to prevent duplicates
+                    # Sort old to new so multiple messages come in order
+                    for msg in sorted(msgs, key=lambda x: x['dt']):
                         sig = hashlib.md5(f"{msg['dt']}{msg['message']}{phone}".encode()).hexdigest()
                         
-                        # Check if already processed
                         conn = sqlite3.connect("bot_database.db")
                         exists = conn.cursor().execute("SELECT 1 FROM processed_sms WHERE signature = ?", (sig,)).fetchone()
                         
                         if not exists:
-                            # Mark as processed
                             conn.cursor().execute("INSERT INTO processed_sms (signature) VALUES (?)", (sig,))
                             conn.commit()
                             
-                            # Prepare Message
-                            msg_body = msg.get("message", "")
+                            msg_body = html.escape(msg.get("message", ""))
                             svc = msg.get("cli", "Service")
                             svc = svc.capitalize() if svc and svc != "null" else "Unknown"
                             
-                            # Enhanced Regex
                             otp_match = re.search(r'(?:\d{3}[-\s]\d{3})|(?<!\d)\d{4,8}(?!\d)', msg_body)
                             otp = otp_match.group(0) if otp_match else "N/A"
                             
@@ -474,26 +471,20 @@ async def master_polling_loop():
                             utxt = f"🌎 Country : {country_name}\n🔢 Number : <code>{phone}</code>\n🔑 OTP : <code>{otp}</code>\n💸 Reward: 🔥"
                             gtxt = f"✅ {country_name} {svc} OTP Received!\n━━━━━━━━━━━━━━━━━━━━\n📱 Number: <code>{masked}</code>\n🌍 Country: {country_name}\n⚙️ Service: {svc}\n🔒 OTP Code: <code>{otp}</code>\n⏳ Time: {ctime}\n━━━━━━━━━━━━━━━━━━━━\nMessage:\n{msg_body}"
                             
-                            safe_print(f"✅ OTP for User {user_id} on {phone}")
-                            
-                            # Send to specific user who owns the number
+                            safe_print(f"✅ OTP for {user_id}: {otp}")
                             try: await bot.send_message(user_id, utxt)
-                            except Exception as e: safe_print(f"User Send Err: {e}")
-                            
-                            # Send to Group
+                            except: pass
                             try: await bot.send_message(GROUP_ID, gtxt)
                             except: pass
                         
                         conn.close()
                 
-                # Rate limiting between numbers
-                await asyncio.sleep(1.5) 
+                await asyncio.sleep(1)
 
-            # Wait before next cycle
             await asyncio.sleep(2)
 
         except Exception as e:
-            safe_print(f"Master Loop Error: {e}")
+            safe_print(f"Loop Error: {e}")
             await asyncio.sleep(5)
 
 # --- SERVER & MAIN ---
@@ -505,11 +496,8 @@ async def start_web_server():
 
 async def main():
     safe_print("System Starting...")
-    
-    # Start Background Tasks
     asyncio.create_task(start_web_server())
-    asyncio.create_task(master_polling_loop()) # The Global Checker
-    
+    asyncio.create_task(master_polling_loop())
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
