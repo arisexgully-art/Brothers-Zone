@@ -14,6 +14,7 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import (
     ReplyKeyboardMarkup, 
     KeyboardButton, 
@@ -46,6 +47,19 @@ def safe_print(text):
         print(text)
     except UnicodeEncodeError:
         print(text.encode('utf-8', errors='ignore').decode('utf-8'))
+
+# --- সেফ কলব্যাক অ্যানসার (NEW FIX) ---
+async def safe_answer(callback: types.CallbackQuery, text: str = None, alert: bool = False):
+    try:
+        if text:
+            await callback.answer(text, show_alert=alert)
+        else:
+            await callback.answer()
+    except TelegramBadRequest:
+        # যদি কুয়েরি পুরনো হয়ে যায়, ইগনোর করবে (এরর দেবে না)
+        pass
+    except Exception as e:
+        safe_print(f"Callback Answer Error: {e}")
 
 # --- ডাটাবেস সেটআপ ---
 def init_db():
@@ -86,40 +100,38 @@ class AdminStates(StatesGroup):
     waiting_broadcast_msg = State()
     last_msg_id = State()
 
-# --- API চেক ফাংশন (POWERFUL VERSION) ---
+# --- API চেক ফাংশন ---
 async def check_otp_api(phone_number):
     clean_number = ''.join(filter(str.isdigit, str(phone_number)))
     
-    params = {
-        "token": API_TOKEN,
-        "filternum": clean_number,
-        "records": 50
-    }
+    params = {}
+    params['token'] = API_TOKEN
+    params['filternum'] = clean_number
+    params['records'] = 50
     
-    # ব্রাউজার হেডার্স (যাতে ব্লক না হয়)
+    # ফিক্স: ব্রাউজার হেডার্স
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
     }
     
-    # টাইমআউট সেট করা (১০ সেকেন্ড)
-    timeout = aiohttp.ClientTimeout(total=10)
+    timeout = aiohttp.ClientTimeout(total=10) # 10 sec timeout
     
     try:
         async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False), timeout=timeout) as session:
             async with session.get(API_URL, params=params, headers=headers) as resp:
                 if resp.status == 200:
-                    try:
-                        data = await resp.json()
-                        if data.get("status") == "success" and data.get("data"):
-                            # তারিখ অনুযায়ী সর্ট করা (নতুন মেসেজ আগে)
+                    data = await resp.json()
+                    if data.get("status") == "success" and data.get("data"):
+                        try:
+                            # নতুন মেসেজ আগে
                             sorted_data = sorted(data["data"], key=lambda x: x['dt'], reverse=True)
                             return sorted_data
-                    except Exception as json_err:
-                        safe_print(f"JSON Error: {json_err}")
+                        except:
+                            return data["data"]
                 else:
-                    safe_print(f"API Status: {resp.status}")
+                    safe_print(f"API Error Status: {resp.status}")
     except Exception as e:
-        safe_print(f"Connection Error: {e}")
+        safe_print(f"API Connection Error: {e}")
         
     return []
 
@@ -157,7 +169,6 @@ async def cmd_start(message: types.Message, state: FSMContext):
     except: pass
     conn.close()
 
-    # ফিক্স: স্টার্ট দিলে আগের টাস্ক ক্যানসেল হবে
     if user_id in user_tasks:
         task = user_tasks[user_id]
         if not task.done():
@@ -176,6 +187,9 @@ async def cmd_start(message: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data == "show_country_list")
 async def show_country_list_handler(callback: types.CallbackQuery, state: FSMContext):
+    # ফিক্স: প্রথমেই কলব্যাক অ্যানসার করা
+    await safe_answer(callback)
+    
     user_id = callback.from_user.id
     if user_id in user_tasks:
         user_tasks[user_id].cancel()
@@ -186,6 +200,8 @@ async def show_country_list_handler(callback: types.CallbackQuery, state: FSMCon
 
 @dp.callback_query(F.data == "cancel_op")
 async def cancel_operation(callback: types.CallbackQuery, state: FSMContext):
+    await safe_answer(callback, text="Operation Cancelled")
+    
     user_id = callback.from_user.id
     if user_id in user_tasks:
         user_tasks[user_id].cancel()
@@ -193,7 +209,6 @@ async def cancel_operation(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.delete()
     if user_id not in ADMIN_IDS: await cmd_start(callback.message, state)
-    else: await callback.answer("অপারেশন ক্যান্সেল করা হয়েছে।")
 
 @dp.callback_query(F.data == "back_home")
 async def back_home(callback: types.CallbackQuery, state: FSMContext):
@@ -270,6 +285,7 @@ async def admin_rem_country_start(message: types.Message):
 
 @dp.callback_query(F.data.startswith("del_c_"))
 async def delete_country_action(callback: types.CallbackQuery):
+    await safe_answer(callback)
     if callback.from_user.id not in ADMIN_IDS: return
     c_id = callback.data.split("_")[2]
     conn = sqlite3.connect("bot_database.db")
@@ -294,6 +310,7 @@ async def admin_add_number_start(message: types.Message):
 
 @dp.callback_query(F.data.startswith("sel_cn_"))
 async def select_input_method(callback: types.CallbackQuery, state: FSMContext):
+    await safe_answer(callback)
     if callback.from_user.id not in ADMIN_IDS: return
     part = callback.data.split("_")
     await state.update_data(country_id=part[2], country_name=part[3])
@@ -303,6 +320,7 @@ async def select_input_method(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data.in_({"in_file", "in_text"}))
 async def request_number_input(callback: types.CallbackQuery, state: FSMContext):
+    await safe_answer(callback)
     if callback.from_user.id not in ADMIN_IDS: return
     mode = callback.data
     await state.update_data(mode=mode)
@@ -352,24 +370,27 @@ async def process_numbers(message: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("buy_"))
 async def user_buy_number(callback: types.CallbackQuery):
-    part = callback.data.split("_")
-    c_id, c_name = part[1], part[2]
     user_id = callback.from_user.id
     
-    # ফিক্স: আগের টাস্ক নিশ্চিতভাবে ক্যানসেল করা
+    # FIX: প্রথমেই অ্যানসার দেওয়া যাতে timeout না হয়
+    await safe_answer(callback)
+    
     if user_id in user_tasks:
         task = user_tasks[user_id]
         if not task.done():
             task.cancel()
-            await asyncio.sleep(0.5) # একটু সময় দেওয়া
+            await asyncio.sleep(0.5)
         del user_tasks[user_id]
+    
+    part = callback.data.split("_")
+    c_id, c_name = part[1], part[2]
     
     conn = sqlite3.connect("bot_database.db")
     res = conn.cursor().execute("SELECT number FROM numbers WHERE country_id = ? AND status = 0 LIMIT 1", (c_id,)).fetchone()
     
     if not res:
         conn.close()
-        await callback.answer("Stock Empty!", show_alert=True)
+        await safe_answer(callback, text="Stock Empty!", alert=True)
         return
     phone = res[0]
     conn.cursor().execute("UPDATE numbers SET status = 1 WHERE number = ?", (phone,))
@@ -386,13 +407,7 @@ async def user_buy_number(callback: types.CallbackQuery):
 # --- OTP CHECKER ---
 async def otp_checker_task(bot: Bot, chat_id: int, phone_number: str, country_name: str, message_id: int):
     last_dt = None
-    
-    # লুপের শুরুতে আমরা API চেক করে last_dt সেট করব যাতে পুরনো মেসেজ না যায়
-    # কিন্তু ইউজার যদি নতুন কেনে এবং সেখানে অলরেডি মেসেজ থাকে, সেটা তাকে দেওয়া উচিত কিনা?
-    # সাধারণত প্যানেল থেকে নতুন মেসেজ আসলে সেটা দেওয়াই ভালো।
-    # আমরা প্রথম চেকে last_dt None রাখি যাতে যে কোনো মেসেজ আসলেই সেটা দেখায়।
-    
-    for _ in range(120): # 10 minutes loop
+    for _ in range(120): # 10 minutes
         try:
             await asyncio.sleep(5)
             msgs = await check_otp_api(phone_number)
@@ -400,17 +415,15 @@ async def otp_checker_task(bot: Bot, chat_id: int, phone_number: str, country_na
             if msgs:
                 latest = msgs[0]
                 
-                # নতুন মেসেজ চেক
                 if last_dt is None or latest.get("dt") != last_dt:
                     last_dt = latest.get("dt")
                     msg_body = latest.get("message", "")
                     
-                    # 1. সার্ভিস ডিটেকশন
+                    # Service
                     service_name = latest.get("cli", "Service")
                     service_name = service_name.capitalize() if service_name and service_name != "null" else "Unknown"
                     
-                    # 2. ইউনিভার্সাল Regex (Universal Regex)
-                    # Chinese, Arabic, English Support
+                    # Universal Regex
                     otp_match = re.search(r'(?:\d{3}[-\s]\d{3})|(?<!\d)\d{4,8}(?!\d)', msg_body)
                     otp = otp_match.group(0) if otp_match else "N/A"
                     
@@ -429,7 +442,6 @@ async def otp_checker_task(bot: Bot, chat_id: int, phone_number: str, country_na
                     except Exception as e: safe_print(f"Group Send Error: {e}")
 
         except asyncio.CancelledError:
-            safe_print(f"Stopping Task for {phone_number}")
             break
         except Exception as e:
             safe_print(f"Loop Error: {e}")
