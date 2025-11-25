@@ -56,9 +56,11 @@ async def safe_answer(callback: types.CallbackQuery, text: str = None, alert: bo
         else: await callback.answer()
     except: pass
 
-# --- DATABASE SETUP ---
+# --- DATABASE SETUP (WAL MODE ADDED) ---
 def init_db():
     conn = sqlite3.connect("bot_database.db")
+    # Enable Write-Ahead Logging for concurrency (Fixes DB Lock issues)
+    conn.execute("PRAGMA journal_mode=WAL;") 
     cursor = conn.cursor()
     
     cursor.execute("""
@@ -138,38 +140,33 @@ def get_join_keyboard():
     kb.append([InlineKeyboardButton(text="✅ VERIFY JOIN", callback_data="verify_join")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
-# --- API Function (Anti-Cache Fix) ---
-async def check_otp_api(phone_number, session):
+# --- API Function (NUCLEAR FIX: Fresh Session Every Time) ---
+async def check_otp_api(phone_number):
     clean_number = ''.join(filter(str.isdigit, str(phone_number)))
     
-    # ⚠️ FIX: Adding random parameter to force NEW data from server
-    # This prevents the "only 1 code received" issue
     params = {
         'token': API_TOKEN, 
         'filternum': clean_number, 
-        'records': 100,  # Increased record limit
-        '_nocache': int(time.time() * 1000) # Unique timestamp
+        'records': 50,
+        't': int(time.time() * 1000) # Force new request
     }
     
     headers = {
-        "User-Agent": f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{random.randint(90, 120)}.0.0.0 Safari/537.36",
-        "Cache-Control": "no-cache, no-store, must-revalidate",
-        "Pragma": "no-cache",
-        "Expires": "0"
+        "User-Agent": f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/{random.randint(100, 130)}.0.0.0 Safari/537.36",
+        "Connection": "close" # Ensure connection closes
     }
     
+    # Create a BRAND NEW session for every single check
+    # This guarantees no "stuck" connections
     try:
-        async with session.get(API_URL, params=params, headers=headers) as resp:
-            if resp.status == 200:
-                try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(API_URL, params=params, headers=headers, timeout=10) as resp:
+                if resp.status == 200:
                     data = await resp.json()
                     if data.get("status") == "success" and data.get("data"):
                         return data["data"]
-                except:
-                    # If JSON fails, try text (sometimes APIs error out with HTML)
-                    safe_print(f"⚠️ JSON Parse Error for {phone_number}")
     except Exception as e: 
-        safe_print(f"⚠️ API Error: {e}")
+        safe_print(f"⚠️ API Fail {phone_number}: {e}")
     return []
 
 # --- Keyboards ---
@@ -231,7 +228,7 @@ async def verify_join_handler(callback: types.CallbackQuery, state: FSMContext):
     else:
         await safe_answer(callback, text="Join First!", alert=True)
 
-# --- USER FLOW ---
+# --- USER FLOW (With DELETE logic) ---
 
 @dp.callback_query(F.data.startswith("buy_"))
 async def user_buy_number(callback: types.CallbackQuery):
@@ -252,6 +249,7 @@ async def user_buy_number(callback: types.CallbackQuery):
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
     
+    # Completely DELETE previous number
     cursor.execute("DELETE FROM numbers WHERE assigned_to = ?", (user_id,))
     conn.commit()
     
@@ -510,21 +508,21 @@ async def bc_send(m: types.Message, state: FSMContext):
     await sts.edit_text(f"✅ Broadcast Sent to {cnt} users.")
     await state.clear()
 
-# ================= POLLING LOGIC =================
+# ================= ROBUST MASTER POLLING (DEBUG ENABLED) =================
 
-async def process_number_task(user_id, phone, c_id, countries, session):
+async def process_number_task(user_id, phone, c_id, countries):
     try:
-        msgs = await check_otp_api(phone, session)
+        # Check API with fresh session
+        msgs = await check_otp_api(phone)
         
         if not msgs: return
 
-        # Loop through all messages without strict sorting first to catch everything
+        # Loop through all messages without strict sorting first
         for msg in msgs:
             msg_body = msg.get("message", "")
             if not msg_body: continue
 
-            # ⚠️ FIX: Using entire message body + timestamp for signature
-            # This ensures even if two messages come same minute, they are treated as unique
+            # Robust Signature (Body + Timestamp)
             sig_raw = f"{msg.get('dt', '')}{msg_body}{phone}"
             sig = hashlib.md5(sig_raw.encode()).hexdigest()
             
@@ -550,7 +548,7 @@ async def process_number_task(user_id, phone, c_id, countries, session):
                 utxt = f"🌎 Country : {country_name}\n🔢 Number : <code>{phone}</code>\n🔑 OTP : <code>{otp}</code>\n💸 Reward: 🔥"
                 gtxt = f"✅ {country_name} {svc} OTP Received!\n━━━━━━━━━━━━━━━━━━━━\n📱 Number: <code>{masked}</code>\n🌍 Country: {country_name}\n⚙️ Service: {svc}\n🔒 OTP Code: <code>{otp}</code>\n⏳ Time: {ctime}\n━━━━━━━━━━━━━━━━━━━━\nMessage:\n{safe_msg}"
                 
-                safe_print(f"✅ FOUND OTP for {user_id}: {otp}")
+                safe_print(f"✅ FOUND OTP for {user_id} on {phone}: {otp}")
                 
                 try: await bot.send_message(user_id, utxt)
                 except: pass
@@ -560,40 +558,39 @@ async def process_number_task(user_id, phone, c_id, countries, session):
             conn.close()
 
     except Exception as e:
-        safe_print(f"⚠️ Error {phone}: {e}")
+        safe_print(f"⚠️ Error processing {phone}: {e}")
 
 async def master_polling_loop():
     safe_print("🚀 Master Polling Loop Started...")
     
-    # Using a short timeout to prevent hanging
-    timeout = aiohttp.ClientTimeout(total=10)
-    
     while True:
         try:
-            # Recreate session every loop to FORCE fresh connections (Total Cache Bypass)
-            async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False), timeout=timeout) as session:
-                
-                conn = sqlite3.connect("bot_database.db")
-                active_orders = conn.cursor().execute("SELECT assigned_to, number, country_id FROM numbers WHERE status = 1").fetchall()
-                countries = {row[0]: row[1] for row in conn.cursor().execute("SELECT id, name FROM countries").fetchall()}
-                conn.close()
+            # 1. Fetch Active Orders
+            conn = sqlite3.connect("bot_database.db")
+            active_orders = conn.cursor().execute("SELECT assigned_to, number, country_id FROM numbers WHERE status = 1").fetchall()
+            countries = {row[0]: row[1] for row in conn.cursor().execute("SELECT id, name FROM countries").fetchall()}
+            conn.close()
 
-                if not active_orders:
-                    await asyncio.sleep(2)
-                    continue
+            if not active_orders:
+                await asyncio.sleep(2)
+                continue
 
-                tasks = []
-                for user_id, phone, c_id in active_orders:
-                    tasks.append(process_number_task(user_id, phone, c_id, countries, session))
-                
-                await asyncio.gather(*tasks)
+            # DEBUG: Print active numbers to console to verify switch
+            # This helps confirm if the bot is tracking the NEW number
+            print(f"📡 Polling {len(active_orders)} numbers: {[x[1] for x in active_orders]}")
+
+            # 2. Parallel Processing
+            tasks = []
+            for user_id, phone, c_id in active_orders:
+                tasks.append(process_number_task(user_id, phone, c_id, countries))
+            
+            await asyncio.gather(*tasks)
+            
+            await asyncio.sleep(1)
 
         except Exception as e:
             safe_print(f"Loop Error: {e}")
             await asyncio.sleep(5)
-            
-        # Wait a bit before creating new session
-        await asyncio.sleep(1)
 
 # --- SERVER & MAIN ---
 async def web_handler(request): return web.Response(text="Bot Running")
