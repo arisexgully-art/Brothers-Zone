@@ -51,12 +51,14 @@ def safe_print(text):
 def init_db():
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
+    
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS countries (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT UNIQUE
         )
     """)
+    
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS numbers (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -65,11 +67,13 @@ def init_db():
             status INTEGER DEFAULT 0
         )
     """)
+    
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY
         )
     """)
+    
     conn.commit()
     conn.close()
 
@@ -82,27 +86,23 @@ class AdminStates(StatesGroup):
     waiting_broadcast_msg = State()
     last_msg_id = State()
 
-# --- API চেক ফাংশন (FIXED) ---
+# --- API চেক ফাংশন ---
 async def check_otp_api(phone_number):
-    # [span_0](start_span)FIX: API তে পাঠানোর জন্য নাম্বার থেকে +, - বা স্পেস সরিয়ে ফেলা হচ্ছে[span_0](end_span)
-    # এর ফলে API তে ফিল্টারিং সঠিকভাবে কাজ করবে।
+    # শুধুমাত্র সংখ্যাগুলো বের করে আনা হচ্ছে যাতে API ফিল্টার কাজ করে
     clean_number = ''.join(filter(str.isdigit, str(phone_number)))
     
-    params = {
-        [span_1](start_span)"token": API_TOKEN, #[span_1](end_span)
-        [span_2](start_span)"filternum": clean_number, #[span_2](end_span)
-        "records": 50 # রেকর্ড সংখ্যা বাড়ানো হয়েছে যাতে পুরনো মেসেজ লোড না হয়
-    }
+    params = {}
+    params['token'] = API_TOKEN
+    params['filternum'] = clean_number
+    params['records'] = 50
     
     try:
-        # SSL False করা হয়েছে যাতে কানেকশন ড্রপ না করে
         async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False)) as session:
             async with session.get(API_URL, params=params) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    [span_3](start_span)#[span_3](end_span) Success Output Format Check
                     if data.get("status") == "success" and data.get("data"):
-                        # FIX: তারিখ অনুযায়ী সর্ট করা হচ্ছে (নতুন মেসেজ সবার আগে)
+                        # নতুন মেসেজ সবার আগে পাওয়ার জন্য তারিখ অনুযায়ী সর্ট করা হচ্ছে
                         try:
                             sorted_data = sorted(data["data"], key=lambda x: x['dt'], reverse=True)
                             return sorted_data
@@ -149,7 +149,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
     except: pass
     conn.close()
 
-    # FIX: স্টার্ট দিলে আগের টাস্ক ক্যানসেল হবে
+    # আগের টাস্ক ক্যানসেল করা
     if user_id in user_tasks:
         task = user_tasks[user_id]
         if not task.done():
@@ -375,8 +375,6 @@ async def otp_checker_task(bot: Bot, chat_id: int, phone_number: str, country_na
     for _ in range(120): # 10 minutes loop
         try:
             await asyncio.sleep(5)
-            # phone_number যেভাবে আছে সেভাবেই check_otp_api তে যাচ্ছে
-            # কিন্তু check_otp_api ফাংশন এটাকে ক্লিন করে ডিজিট বানিয়ে API তে পাঠাবে
             msgs = await check_otp_api(phone_number)
             
             if msgs:
@@ -390,9 +388,10 @@ async def otp_checker_task(bot: Bot, chat_id: int, phone_number: str, country_na
                     service_name = latest.get("cli", "Service")
                     service_name = service_name.capitalize() if service_name and service_name != "null" else "Unknown"
                     
-                    # 2. ইউনিভার্সাল Regex (Universal Regex Fix)
-                    # চীনা ভাষার জন্যও কাজ করবে
-                    # 162-828 বা 162 828 বা 123456
+                    # 2. ইউনিভার্সাল Regex
+                    # চীনা, আরবি বা অন্য ভাষায় কোড বের করার জন্য
+                    # প্যাটার্ন ১: 123-456 বা 123 456
+                    # প্যাটার্ন ২: 4-8 ডিজিটের সংখ্যা যা অন্য কোনো ডিজিটের সাথে লেগে নেই
                     otp_match = re.search(r'(?:\d{3}[-\s]\d{3})|(?<!\d)\d{4,8}(?!\d)', msg_body)
                     otp = otp_match.group(0) if otp_match else "N/A"
                     
