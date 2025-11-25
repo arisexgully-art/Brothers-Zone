@@ -4,6 +4,7 @@ import sqlite3
 import aiohttp
 import re
 import os
+import sys
 from datetime import datetime
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
@@ -38,6 +39,13 @@ bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTM
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 user_tasks = {}
+
+# --- সেফ প্রিন্ট (Unicode Error ফিক্স) ---
+def safe_print(text):
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        print(text.encode('utf-8', errors='ignore').decode('utf-8'))
 
 # --- ডাটাবেস সেটআপ ---
 def init_db():
@@ -81,12 +89,10 @@ class AdminStates(StatesGroup):
 # --- API চেক ফাংশন ---
 async def check_otp_api(phone_number):
     clean_number = ''.join(filter(str.isdigit, str(phone_number)))
-    
-    # ক্লিন ডিকশনারি (কোনো কমেন্ট নেই)
     params = {
         "token": API_TOKEN,
         "filternum": clean_number,
-        "records": 20
+        "records": 50 
     }
     
     try:
@@ -97,9 +103,9 @@ async def check_otp_api(phone_number):
                     if data.get("status") == "success" and data.get("data"):
                         return data["data"]
                 else:
-                    print(f"API Error Status: {resp.status}")
+                    safe_print(f"API Error Status: {resp.status}")
     except Exception as e:
-        print(f"API Connection Error: {e}")
+        safe_print(f"API Connection Error: {e}")
         
     return []
 
@@ -129,17 +135,21 @@ async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
     
+    # ইউজার ডাটাবেসে সেভ
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
     try:
         cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
         conn.commit()
-    except:
-        pass
+    except: pass
     conn.close()
 
+    # --- FIX: আগের টাস্ক ক্যানসেল করা ---
     if user_id in user_tasks:
-        user_tasks[user_id].cancel()
+        task = user_tasks[user_id]
+        if not task.done():
+            task.cancel()
+            safe_print(f"Cancelled active task for User: {user_id}")
         del user_tasks[user_id]
 
     if user_id in ADMIN_IDS:
@@ -203,15 +213,14 @@ async def admin_broadcast_send(message: types.Message, state: FSMContext):
             await bot.send_message(u[0], text)
             count += 1
             await asyncio.sleep(0.05)
-        except:
-            pass
-            
+        except: pass
     await sts.edit_text(f"✅ Sent to {count} users.")
     await state.clear()
 
 @dp.message(F.text == "ADD COUNTRY", F.from_user.id.in_(ADMIN_IDS))
 async def admin_add_country_start(message: types.Message, state: FSMContext):
-    msg = await message.answer("Country নাম:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Cancel", callback_data="back_home")]]))
+    msg = await message.answer("Country নাম:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Cancel", callback_data="back_home")]])
+    )
     await state.update_data(last_msg_id=msg.message_id)
     await state.set_state(AdminStates.waiting_country_name)
 
@@ -225,8 +234,7 @@ async def save_country_name(message: types.Message, state: FSMContext):
         conn.cursor().execute("INSERT INTO countries (name) VALUES (?)", (name,))
         conn.commit()
         res = f"✅ '{name}' Added."
-    except:
-        res = f"❌ '{name}' Exists."
+    except: res = f"❌ '{name}' Exists."
     conn.close()
     try: await message.delete()
     except: pass
@@ -354,13 +362,12 @@ async def user_buy_number(callback: types.CallbackQuery):
     kb = [[InlineKeyboardButton(text="CHANGE NUMBER", callback_data=f"buy_{c_id}_{c_name}")], [InlineKeyboardButton(text="CHANGE COUNTRY", callback_data="show_country_list")], [InlineKeyboardButton(text="CANCEL OPERATION", callback_data="cancel_op")]]
     sent_msg = await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
     
-    print(f"Task Started: {phone}")
+    safe_print(f"Task Started: {phone}")
     user_tasks[user_id] = asyncio.create_task(otp_checker_task(bot, callback.message.chat.id, phone, c_name, sent_msg.message_id))
 
-# --- OTP CHECKER ---
+# --- OTP CHECKER (IMPROVED FOR CHINESE & ALL LANGUAGES) ---
 async def otp_checker_task(bot: Bot, chat_id: int, phone_number: str, country_name: str, message_id: int):
     last_dt = None
-    # লুপ যাতে ক্র্যাশ না করে তাই Try-Except
     for _ in range(120): # 10 minutes loop
         try:
             await asyncio.sleep(5)
@@ -369,43 +376,39 @@ async def otp_checker_task(bot: Bot, chat_id: int, phone_number: str, country_na
             if msgs:
                 latest = msgs[0]
                 
-                # নতুন মেসেজ ডিটেকশন
                 if last_dt is None or latest.get("dt") != last_dt:
                     last_dt = latest.get("dt")
                     msg_body = latest.get("message", "")
                     
-                    # 1. সার্ভিস নাম ডিটেক্ট করা
+                    # 1. সার্ভিস ডিটেকশন
                     service_name = latest.get("cli", "Service")
-                    if not service_name or service_name == "null":
-                        service_name = "Unknown"
-                    else:
-                        service_name = service_name.capitalize()
+                    service_name = service_name.capitalize() if service_name and service_name != "null" else "Unknown"
                     
-                    # 2. ইউনিভার্সাল Regex (সব ভাষার জন্য)
-                    # এটি খুঁজবে: XXX-XXX বা XXX XXX বা XXXXXX (৪-৮ ডিজিট)
-                    otp_match = re.search(r'(\d{3}[\s-]?\d{3})|(\b\d{4,8}\b)', msg_body)
+                    # 2. ইউনিভার্সাল Regex (Universal Regex Fix)
+                    # এটি চাইনিজ, রাশিয়ান সহ সব ভাষার ভেতর থেকে কোড বের করবে।
+                    # প্যাটার্ন ১: 123-456 বা 123 456
+                    # প্যাটার্ন ২: 123456 (৪-৮ ডিজিট) যা অন্য কোনো ডিজিটের সাথে লেগে নেই
+                    otp_match = re.search(r'(?:\d{3}[-\s]\d{3})|(?<!\d)\d{4,8}(?!\d)', msg_body)
                     otp = otp_match.group(0) if otp_match else "N/A"
                     
                     cur_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    
-                    # গ্রুপে নাম্বার লুকানো (Masking)
                     masked = f"{phone_number[:4]}***{phone_number[-4:]}" if len(phone_number) > 7 else phone_number
                     
                     user_txt = f"🌎 Country : {country_name}\n🔢 Number : <code>{phone_number}</code>\n🔑 OTP : <code>{otp}</code>\n💸 Reward: 🔥"
                     group_txt = f"✅ {country_name} {service_name} OTP Received!\n━━━━━━━━━━━━━━━━━━━━\n📱 Number: <code>{masked}</code>\n🌍 Country: {country_name}\n⚙️ Service: {service_name}\n🔒 OTP Code: <code>{otp}</code>\n⏳ Time: {cur_time}\n━━━━━━━━━━━━━━━━━━━━\nMessage:\n{msg_body}"
                     
-                    print(f"OTP Found: {otp} for {phone_number}")
+                    safe_print(f"OTP Found: {otp} for {phone_number}")
                     
                     try: await bot.send_message(chat_id, user_txt)
-                    except Exception as e: print(f"User Send Error: {e}")
+                    except Exception as e: safe_print(f"User Send Error: {e}")
                     
                     try: await bot.send_message(GROUP_ID, group_txt)
-                    except Exception as e: print(f"Group Send Error: {e}")
+                    except Exception as e: safe_print(f"Group Send Error: {e}")
 
         except asyncio.CancelledError:
             break
         except Exception as e:
-            print(f"Loop Error: {e}")
+            safe_print(f"Loop Error: {e}")
             await asyncio.sleep(5)
 
 # --- WEB SERVER ---
@@ -422,7 +425,7 @@ async def start_web_server():
     await site.start()
 
 async def main():
-    print("Bot is running...")
+    safe_print("Bot is running...")
     await start_web_server()
     await dp.start_polling(bot)
 
