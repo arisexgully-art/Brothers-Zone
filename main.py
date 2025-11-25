@@ -7,6 +7,8 @@ import os
 import sys
 import hashlib
 import html
+import random
+import time
 from datetime import datetime
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
@@ -136,27 +138,38 @@ def get_join_keyboard():
     kb.append([InlineKeyboardButton(text="✅ VERIFY JOIN", callback_data="verify_join")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
-# --- API Function (Optimized) ---
+# --- API Function (Anti-Cache Fix) ---
 async def check_otp_api(phone_number, session):
-    """
-    Fetches OTP using an existing session for better performance.
-    """
     clean_number = ''.join(filter(str.isdigit, str(phone_number)))
-    params = {'token': API_TOKEN, 'filternum': clean_number, 'records': 50}
     
-    # Random User Agent to avoid blocking
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0.4472.124 Safari/537.36"}
+    # ⚠️ FIX: Adding random parameter to force NEW data from server
+    # This prevents the "only 1 code received" issue
+    params = {
+        'token': API_TOKEN, 
+        'filternum': clean_number, 
+        'records': 100,  # Increased record limit
+        '_nocache': int(time.time() * 1000) # Unique timestamp
+    }
+    
+    headers = {
+        "User-Agent": f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{random.randint(90, 120)}.0.0.0 Safari/537.36",
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Pragma": "no-cache",
+        "Expires": "0"
+    }
     
     try:
         async with session.get(API_URL, params=params, headers=headers) as resp:
             if resp.status == 200:
-                data = await resp.json()
-                if data.get("status") == "success" and data.get("data"):
-                    return data["data"]
-            else:
-                safe_print(f"⚠️ API Error {resp.status} for {phone_number}")
+                try:
+                    data = await resp.json()
+                    if data.get("status") == "success" and data.get("data"):
+                        return data["data"]
+                except:
+                    # If JSON fails, try text (sometimes APIs error out with HTML)
+                    safe_print(f"⚠️ JSON Parse Error for {phone_number}")
     except Exception as e: 
-        safe_print(f"⚠️ API Connection Error for {phone_number}: {e}")
+        safe_print(f"⚠️ API Error: {e}")
     return []
 
 # --- Keyboards ---
@@ -191,7 +204,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
     try: conn.cursor().execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,)); conn.commit()
     except: pass
     
-    # DELETE numbers for this user on start
+    # Delete active session on start
     conn.cursor().execute("DELETE FROM numbers WHERE assigned_to = ?", (user_id,))
     conn.commit()
     conn.close()
@@ -218,7 +231,7 @@ async def verify_join_handler(callback: types.CallbackQuery, state: FSMContext):
     else:
         await safe_answer(callback, text="Join First!", alert=True)
 
-# --- USER FLOW (PERMANENT DELETE + LOADING FIX) ---
+# --- USER FLOW ---
 
 @dp.callback_query(F.data.startswith("buy_"))
 async def user_buy_number(callback: types.CallbackQuery):
@@ -239,41 +252,31 @@ async def user_buy_number(callback: types.CallbackQuery):
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
     
-    # DELETE previous number
     cursor.execute("DELETE FROM numbers WHERE assigned_to = ?", (user_id,))
     conn.commit()
     
     assigned_phone = None
     
-    # Try 5 times to get a RANDOM free number
     for _ in range(5):
         row = cursor.execute("SELECT id, number FROM numbers WHERE country_id = ? AND status = 0 ORDER BY RANDOM() LIMIT 1", (c_id,)).fetchone()
-        
-        if not row:
-            break
+        if not row: break
             
         num_id, phone = row
-        
-        # Atomic Lock
         cursor.execute("UPDATE numbers SET status = 1, assigned_to = ? WHERE id = ? AND status = 0", (user_id, num_id))
         
         if cursor.rowcount > 0:
             conn.commit()
             assigned_phone = phone
             break
-        else:
-            continue
+        else: continue
             
     conn.close()
     
     if not assigned_phone:
         kb = [[InlineKeyboardButton(text="🔁 TRY AGAIN", callback_data=f"buy_{c_id}_{c_name}")], 
               [InlineKeyboardButton(text="🔙 BACK", callback_data="show_country_list")]]
-        
-        try:
-            await callback.message.edit_text(f"⚠️ <b>Stock Empty or Busy for {c_name}!</b>\nPlease try again.", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
-        except:
-            await callback.message.answer(f"⚠️ <b>Stock Empty for {c_name}!</b>")
+        try: await callback.message.edit_text(f"⚠️ <b>Stock Empty or Busy for {c_name}!</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+        except: pass
         return
     
     text = f"🌎 {c_name} Assigned:\n<code>+{assigned_phone}</code>\n\nWaiting for OTP..."
@@ -507,26 +510,22 @@ async def bc_send(m: types.Message, state: FSMContext):
     await sts.edit_text(f"✅ Broadcast Sent to {cnt} users.")
     await state.clear()
 
-# ================= ROBUST MASTER POLLING (FIXED) =================
+# ================= POLLING LOGIC =================
 
 async def process_number_task(user_id, phone, c_id, countries, session):
-    """
-    Checks ONE number for OTP.
-    Used inside asyncio.gather for parallel processing.
-    """
     try:
         msgs = await check_otp_api(phone, session)
         
-        if not msgs:
-            return
+        if not msgs: return
 
-        # Sort: Oldest to Newest
-        for msg in sorted(msgs, key=lambda x: x['dt']):
+        # Loop through all messages without strict sorting first to catch everything
+        for msg in msgs:
             msg_body = msg.get("message", "")
-            
-            # Create a robust unique signature
-            # Including message body ensures even if timestamp is weird, we catch content
-            sig_raw = f"{msg['dt']}{msg_body[:20]}{phone}"
+            if not msg_body: continue
+
+            # ⚠️ FIX: Using entire message body + timestamp for signature
+            # This ensures even if two messages come same minute, they are treated as unique
+            sig_raw = f"{msg.get('dt', '')}{msg_body}{phone}"
             sig = hashlib.md5(sig_raw.encode()).hexdigest()
             
             conn = sqlite3.connect("bot_database.db")
@@ -537,16 +536,13 @@ async def process_number_task(user_id, phone, c_id, countries, session):
                 cursor.execute("INSERT INTO processed_sms (signature) VALUES (?)", (sig,))
                 conn.commit()
                 
-                # --- Processing Logic ---
                 country_name = countries.get(c_id, "Unknown")
                 svc = msg.get("cli", "Service")
                 svc = svc.capitalize() if svc and svc != "null" else "Unknown"
                 
-                # Robust OTP Regex (searches for 4-8 digit codes)
                 otp_match = re.search(r'(?:\d{3}[-\s]\d{3})|(?<!\d)\d{4,8}(?!\d)', msg_body)
                 otp = otp_match.group(0) if otp_match else "N/A"
                 
-                # Safe HTML Escape
                 safe_msg = html.escape(msg_body)
                 ctime = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 masked = f"{phone[:4]}***{phone[-4:]}" if len(phone) > 7 else phone
@@ -556,28 +552,27 @@ async def process_number_task(user_id, phone, c_id, countries, session):
                 
                 safe_print(f"✅ FOUND OTP for {user_id}: {otp}")
                 
-                # Send to User
                 try: await bot.send_message(user_id, utxt)
-                except Exception as e: safe_print(f"❌ Failed to send to user {user_id}: {e}")
-                
-                # Send to Group
+                except: pass
                 try: await bot.send_message(GROUP_ID, gtxt)
                 except: pass
             
             conn.close()
 
     except Exception as e:
-        safe_print(f"⚠️ Error processing {phone}: {e}")
+        safe_print(f"⚠️ Error {phone}: {e}")
 
 async def master_polling_loop():
-    safe_print("🚀 High-Performance Master Polling Loop Started...")
+    safe_print("🚀 Master Polling Loop Started...")
     
-    # Persistent Session for speed
-    timeout = aiohttp.ClientTimeout(total=20)
-    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False, limit=100), timeout=timeout) as session:
-        while True:
-            try:
-                # 1. Fetch Active Orders
+    # Using a short timeout to prevent hanging
+    timeout = aiohttp.ClientTimeout(total=10)
+    
+    while True:
+        try:
+            # Recreate session every loop to FORCE fresh connections (Total Cache Bypass)
+            async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False), timeout=timeout) as session:
+                
                 conn = sqlite3.connect("bot_database.db")
                 active_orders = conn.cursor().execute("SELECT assigned_to, number, country_id FROM numbers WHERE status = 1").fetchall()
                 countries = {row[0]: row[1] for row in conn.cursor().execute("SELECT id, name FROM countries").fetchall()}
@@ -587,21 +582,18 @@ async def master_polling_loop():
                     await asyncio.sleep(2)
                     continue
 
-                # 2. Concurrent Processing (The Fix)
-                # Instead of waiting for one, we check ALL at the same time
                 tasks = []
                 for user_id, phone, c_id in active_orders:
                     tasks.append(process_number_task(user_id, phone, c_id, countries, session))
                 
-                # Run all tasks parallelly
                 await asyncio.gather(*tasks)
 
-                # 3. Small buffer to prevent CPU spike
-                await asyncio.sleep(1.5)
-
-            except Exception as e:
-                safe_print(f"🔥 Critical Loop Error: {e}")
-                await asyncio.sleep(5)
+        except Exception as e:
+            safe_print(f"Loop Error: {e}")
+            await asyncio.sleep(5)
+            
+        # Wait a bit before creating new session
+        await asyncio.sleep(1)
 
 # --- SERVER & MAIN ---
 async def web_handler(request): return web.Response(text="Bot Running")
