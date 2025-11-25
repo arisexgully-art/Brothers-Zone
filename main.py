@@ -44,7 +44,6 @@ def init_db():
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
     
-    # কান্ট্রি টেবিল
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS countries (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -52,7 +51,6 @@ def init_db():
         )
     """)
     
-    # নাম্বার টেবিল
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS numbers (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -62,7 +60,6 @@ def init_db():
         )
     """)
     
-    # ইউজার টেবিল (Broadcast এর জন্য)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY
@@ -78,17 +75,18 @@ init_db()
 class AdminStates(StatesGroup):
     waiting_country_name = State()
     waiting_number_input = State()
-    waiting_broadcast_msg = State() # ব্রডকাস্ট মেসেজের জন্য স্টেট
+    waiting_broadcast_msg = State()
     last_msg_id = State()
 
-# --- API চেক ফাংশন ---
+# --- API চেক ফাংশন (ফিক্সড) ---
 async def check_otp_api(phone_number):
-    # API তে পাঠানোর আগে নাম্বার থেকে '+' বা স্পেস সরিয়ে শুধু ডিজিট রাখা ভালো
+    # নাম্বার ক্লিন করা (শুধু সংখ্যা রাখা)
     clean_number = ''.join(filter(str.isdigit, str(phone_number)))
     
+    # সিনট্যাক্স এরর ফিক্স করার জন্য ক্লিন ডিকশনারি
     params = {
         "token": API_TOKEN,
-        [span_0](start_span)"filternum": clean_number, #[span_0](end_span) filternum parameter
+        "filternum": clean_number,
         "records": 20
     }
     
@@ -97,7 +95,6 @@ async def check_otp_api(phone_number):
             async with session.get(API_URL, params=params) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    [span_1](start_span)# Checking success status
                     if data.get("status") == "success" and data.get("data"):
                         return data["data"]
                 else:
@@ -133,7 +130,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
     
-    # ইউজার সেভ করা (Broadcast এর জন্য)
+    # ইউজার সেভ (ব্রডকাস্টের জন্য)
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
     try:
@@ -182,9 +179,9 @@ async def cancel_operation(callback: types.CallbackQuery, state: FSMContext):
 async def back_home(callback: types.CallbackQuery, state: FSMContext):
     await cancel_operation(callback, state)
 
-# --- ADMIN ACTIONS (Broadcast সহ) ---
+# --- ADMIN ACTIONS ---
 
-# 1. BROADCAST FEATURE
+# 1. BROADCAST
 @dp.message(F.text == "📢 BROADCAST", F.from_user.id.in_(ADMIN_IDS))
 async def admin_broadcast_start(message: types.Message, state: FSMContext):
     msg = await message.answer(
@@ -197,7 +194,6 @@ async def admin_broadcast_start(message: types.Message, state: FSMContext):
 @dp.message(AdminStates.waiting_broadcast_msg, F.from_user.id.in_(ADMIN_IDS))
 async def admin_broadcast_send(message: types.Message, state: FSMContext):
     broadcast_text = message.text
-    
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
     cursor.execute("SELECT user_id FROM users")
@@ -211,9 +207,9 @@ async def admin_broadcast_send(message: types.Message, state: FSMContext):
         try:
             await bot.send_message(user[0], broadcast_text)
             count += 1
-            await asyncio.sleep(0.05) # Flood limit protection
+            await asyncio.sleep(0.05)
         except:
-            pass # ইউজার ব্লক করলে স্কিপ করবে
+            pass
             
     await status_msg.edit_text(f"✅ ব্রডকাস্ট সম্পন্ন!\nমোট পাঠানো হয়েছে: {count} জন ইউজারকে।")
     await state.clear()
@@ -371,7 +367,7 @@ async def user_buy_number(callback: types.CallbackQuery):
     print(f"Started monitoring for: {phone_number}")
     user_tasks[user_id] = asyncio.create_task(otp_checker_task(bot, callback.message.chat.id, phone_number, c_name, sent_msg.message_id))
 
-# --- OTP CHECKER (MULTI-LANGUAGE SUPPORT & SERVICE DETECTION) ---
+# --- OTP CHECKER ---
 async def otp_checker_task(bot: Bot, chat_id: int, phone_number: str, country_name: str, message_id: int):
     last_dt = None
     try:
@@ -383,34 +379,26 @@ async def otp_checker_task(bot: Bot, chat_id: int, phone_number: str, country_na
                 print(f"Data for {phone_number}: {len(msgs)} messages")
                 latest = msgs[0]
                 
-                # চেক করা হচ্ছে এটা নতুন মেসেজ কিনা
                 if last_dt is None or latest.get("dt") != last_dt:
                     last_dt = latest.get("dt")
                     msg_body = latest.get("message", "")
                     
-                    # --- SERVICE DETECTION ---
-                    #[span_1](end_span) API returns "cli" which is the sender/service name
+                    # Service Detection from API
                     service_name = latest.get("cli", "Service")
                     if not service_name or service_name == "null":
                         service_name = "Unknown"
                     else:
-                        service_name = service_name.capitalize() # "msverify" -> "Msverify"
+                        service_name = service_name.capitalize()
                     
-                    # --- UNIVERSAL OTP REGEX ---
-                    # 1. \d{3}[- ]\d{3} -> 123-456 or 123 456
-                    # 2. \b\d{4,8}\b -> 1234, 123456 (English boundaries)
-                    # 3. (?<!\d)\d{4,8}(?!\d) -> Boundary independent digits (Foreign Langs)
-                    
+                    # Universal Regex for OTP
                     otp_match = re.search(r'(?:\d{3}[- ]\d{3})|(?<!\d)\d{4,8}(?!\d)', msg_body)
                     otp = otp_match.group(0) if otp_match else "N/A"
                     
                     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     
-                    # Masked Number Logic for Group
+                    # Group Masking
                     masked_number = f"{phone_number[:4]}***{phone_number[-4:]}" if len(phone_number) > 7 else phone_number
                     
-                    # Formats
-                    # Service Name is now DYNAMIC (from API 'cli')
                     user_text = f"🌎 Country : {country_name}\n🔢 Number : <code>{phone_number}</code>\n🔑 OTP : <code>{otp}</code>\n💸 Reward: 🔥"
                     group_text = f"✅ {country_name} {service_name} OTP Received!\n━━━━━━━━━━━━━━━━━━━━\n📱 Number: <code>{masked_number}</code>\n🌍 Country: {country_name}\n⚙️ Service: {service_name}\n🔒 OTP Code: <code>{otp}</code>\n⏳ Time: {current_time}\n━━━━━━━━━━━━━━━━━━━━\nMessage:\n{msg_body}"
                     
