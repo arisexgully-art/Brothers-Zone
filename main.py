@@ -25,7 +25,7 @@ from aiogram.types import (
 BOT_TOKEN = "8070506568:AAE6mUi2wcXMRTnZRwHUut66Nlu1NQC8Opo"
 ADMIN_IDS = [8308179143, 5085250851]
 
-# [span_0](start_span)API Settings[span_0](end_span)
+# API Settings
 API_TOKEN = "Rk5CRTSGcX9fh1WHeIVxYViVlEhaUmSDXG1Qe1dOc2ZykmZGiw=="
 API_URL = "http://51.77.216.195/crapi/dgroup/viewstats"
 
@@ -43,12 +43,14 @@ user_tasks = {}
 def init_db():
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
+    
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS countries (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT UNIQUE
         )
     """)
+    
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS numbers (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -57,11 +59,13 @@ def init_db():
             status INTEGER DEFAULT 0
         )
     """)
+    
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY
         )
     """)
+    
     conn.commit()
     conn.close()
 
@@ -77,23 +81,26 @@ class AdminStates(StatesGroup):
 # --- API চেক ফাংশন ---
 async def check_otp_api(phone_number):
     clean_number = ''.join(filter(str.isdigit, str(phone_number)))
+    
+    # ক্লিন ডিকশনারি (কোনো কমেন্ট নেই)
     params = {
-        [span_1](start_span)"token": API_TOKEN, #[span_1](end_span)
-        [span_2](start_span)"filternum": clean_number, #[span_2](end_span)
-        [span_3](start_span)"records": 20 #[span_3](end_span)
+        "token": API_TOKEN,
+        "filternum": clean_number,
+        "records": 20
     }
+    
     try:
         async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False)) as session:
             async with session.get(API_URL, params=params) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    [span_4](start_span)# Success check
                     if data.get("status") == "success" and data.get("data"):
                         return data["data"]
                 else:
                     print(f"API Error Status: {resp.status}")
     except Exception as e:
         print(f"API Connection Error: {e}")
+        
     return []
 
 # --- কিবোর্ড ---
@@ -121,12 +128,14 @@ def get_country_inline_keyboard():
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
+    
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
     try:
         cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
         conn.commit()
-    except: pass
+    except:
+        pass
     conn.close()
 
     if user_id in user_tasks:
@@ -172,7 +181,10 @@ async def back_home(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.message(F.text == "📢 BROADCAST", F.from_user.id.in_(ADMIN_IDS))
 async def admin_broadcast_start(message: types.Message, state: FSMContext):
-    msg = await message.answer("ব্রডকাস্ট মেসেজ লিখুন:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Cancel", callback_data="back_home")]]))
+    msg = await message.answer(
+        "ব্রডকাস্ট মেসেজ লিখুন:", 
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Cancel", callback_data="back_home")]])
+    )
     await state.update_data(last_msg_id=msg.message_id)
     await state.set_state(AdminStates.waiting_broadcast_msg)
 
@@ -182,14 +194,18 @@ async def admin_broadcast_send(message: types.Message, state: FSMContext):
     conn = sqlite3.connect("bot_database.db")
     users = conn.cursor().execute("SELECT user_id FROM users").fetchall()
     conn.close()
+    
     count = 0
     sts = await message.answer("🚀 Sending...")
+    
     for u in users:
         try:
             await bot.send_message(u[0], text)
             count += 1
             await asyncio.sleep(0.05)
-        except: pass
+        except:
+            pass
+            
     await sts.edit_text(f"✅ Sent to {count} users.")
     await state.clear()
 
@@ -209,7 +225,8 @@ async def save_country_name(message: types.Message, state: FSMContext):
         conn.cursor().execute("INSERT INTO countries (name) VALUES (?)", (name,))
         conn.commit()
         res = f"✅ '{name}' Added."
-    except: res = f"❌ '{name}' Exists."
+    except:
+        res = f"❌ '{name}' Exists."
     conn.close()
     try: await message.delete()
     except: pass
@@ -225,7 +242,9 @@ async def admin_rem_country_start(message: types.Message):
     conn.close()
     if not countries: await message.answer("Empty!")
     else:
-        buttons = [[InlineKeyboardButton(text=f"❌ {c[1]}", callback_data=f"del_c_{c[0]}")] for c in countries]
+        buttons = []
+        for c in countries:
+            buttons.append([InlineKeyboardButton(text=f"❌ {c[1]}", callback_data=f"del_c_{c[0]}")])
         buttons.append([InlineKeyboardButton(text="Cancel", callback_data="back_home")])
         await message.answer("Select to Remove:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
@@ -247,7 +266,9 @@ async def admin_add_number_start(message: types.Message):
     conn.close()
     if not countries: await message.answer("Add Country First!")
     else:
-        buttons = [[InlineKeyboardButton(text=c[1], callback_data=f"sel_cn_{c[0]}_{c[1]}")] for c in countries]
+        buttons = []
+        for c in countries:
+            buttons.append([InlineKeyboardButton(text=c[1], callback_data=f"sel_cn_{c[0]}_{c[1]}")])
         buttons.append([InlineKeyboardButton(text="Cancel", callback_data="back_home")])
         await message.answer("Select Country:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
@@ -288,7 +309,6 @@ async def process_numbers(message: types.Message, state: FSMContext):
         return
     
     raw_numbers = re.split(r'[,\n\r]+', content)
-    # Filter only digits
     valid_numbers = [n.strip() for n in raw_numbers if n.strip().isdigit()]
     
     conn = sqlite3.connect("bot_database.db")
@@ -337,31 +357,38 @@ async def user_buy_number(callback: types.CallbackQuery):
     print(f"Task Started: {phone}")
     user_tasks[user_id] = asyncio.create_task(otp_checker_task(bot, callback.message.chat.id, phone, c_name, sent_msg.message_id))
 
-# --- ROBUST OTP CHECKER ---
+# --- OTP CHECKER ---
 async def otp_checker_task(bot: Bot, chat_id: int, phone_number: str, country_name: str, message_id: int):
     last_dt = None
-    # লুপ যাতে ক্র্যাশ না করে তাই Try-Except লুপের ভেতরে দেওয়া হয়েছে
-    for _ in range(120): # 10 minutes
+    # লুপ যাতে ক্র্যাশ না করে তাই Try-Except
+    for _ in range(120): # 10 minutes loop
         try:
             await asyncio.sleep(5)
             msgs = await check_otp_api(phone_number)
             
             if msgs:
                 latest = msgs[0]
+                
+                # নতুন মেসেজ ডিটেকশন
                 if last_dt is None or latest.get("dt") != last_dt:
                     last_dt = latest.get("dt")
                     msg_body = latest.get("message", "")
                     
-                    # 1. Service Detection[span_4](end_span)
+                    # 1. সার্ভিস নাম ডিটেক্ট করা
                     service_name = latest.get("cli", "Service")
-                    service_name = service_name.capitalize() if service_name and service_name != "null" else "Unknown"
+                    if not service_name or service_name == "null":
+                        service_name = "Unknown"
+                    else:
+                        service_name = service_name.capitalize()
                     
-                    # 2. Advanced Regex for OTP (Includes XXX-XXX)
-                    # This matches: 123-456 OR 123 456 OR 123456 (4-8 digits)
+                    # 2. ইউনিভার্সাল Regex (সব ভাষার জন্য)
+                    # এটি খুঁজবে: XXX-XXX বা XXX XXX বা XXXXXX (৪-৮ ডিজিট)
                     otp_match = re.search(r'(\d{3}[\s-]?\d{3})|(\b\d{4,8}\b)', msg_body)
                     otp = otp_match.group(0) if otp_match else "N/A"
                     
                     cur_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    
+                    # গ্রুপে নাম্বার লুকানো (Masking)
                     masked = f"{phone_number[:4]}***{phone_number[-4:]}" if len(phone_number) > 7 else phone_number
                     
                     user_txt = f"🌎 Country : {country_name}\n🔢 Number : <code>{phone_number}</code>\n🔑 OTP : <code>{otp}</code>\n💸 Reward: 🔥"
@@ -369,22 +396,21 @@ async def otp_checker_task(bot: Bot, chat_id: int, phone_number: str, country_na
                     
                     print(f"OTP Found: {otp} for {phone_number}")
                     
-                    # Safe Send (User)
                     try: await bot.send_message(chat_id, user_txt)
                     except Exception as e: print(f"User Send Error: {e}")
                     
-                    # Safe Send (Group)
                     try: await bot.send_message(GROUP_ID, group_txt)
                     except Exception as e: print(f"Group Send Error: {e}")
 
         except asyncio.CancelledError:
-            break # Task Cancelled
+            break
         except Exception as e:
-            print(f"Loop Error (Retrying): {e}")
-            await asyncio.sleep(5) # Wait before retry
+            print(f"Loop Error: {e}")
+            await asyncio.sleep(5)
 
 # --- WEB SERVER ---
-async def web_handler(request): return web.Response(text="Bot Running")
+async def web_handler(request):
+    return web.Response(text="Bot is running!")
 
 async def start_web_server():
     app = web.Application()
@@ -396,7 +422,7 @@ async def start_web_server():
     await site.start()
 
 async def main():
-    print("Bot Started...")
+    print("Bot is running...")
     await start_web_server()
     await dp.start_polling(bot)
 
