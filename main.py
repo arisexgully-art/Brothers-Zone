@@ -12,7 +12,7 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ChatType, ChatMemberStatus
-from aiogram.filters import Command, StateFilter
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -26,7 +26,6 @@ from aiogram.types import (
 
 # ================= CONFIGURATION =================
 
-# ⚠️ SECURITY WARNING: এই টোকেনগুলো পাবলিক করবেন না।
 BOT_TOKEN = "8070506568:AAE6mUi2wcXMRTnZRwHUut66Nlu1NQC8Opo"
 ADMIN_IDS = [8308179143, 5085250851]
 
@@ -34,7 +33,7 @@ ADMIN_IDS = [8308179143, 5085250851]
 API_TOKEN = "Rk5CRTSGcX9fh1WHeIVxYViVlEhaUmSDXG1Qe1dOc2ZykmZGiw=="
 API_URL = "http://51.77.216.195/crapi/dgroup/viewstats"
 
-# Group ID
+# Group ID (For logs)
 GROUP_ID = -1003472422744
 
 # =================================================
@@ -67,6 +66,7 @@ def init_db():
         )
     """)
     
+    # Numbers Table (status: 0=Free, 1=Busy/Assigned)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS numbers (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -186,6 +186,8 @@ async def cmd_start(message: types.Message, state: FSMContext):
     conn = sqlite3.connect("bot_database.db")
     try: conn.cursor().execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,)); conn.commit()
     except: pass
+    
+    # Reset user status on start
     conn.cursor().execute("UPDATE numbers SET status = 0, assigned_to = NULL WHERE assigned_to = ?", (user_id,))
     conn.commit()
     conn.close()
@@ -198,8 +200,10 @@ async def cmd_start(message: types.Message, state: FSMContext):
         await message.answer("👑 Admin Panel:", reply_markup=get_admin_reply_keyboard())
     
     kb = get_country_inline_keyboard()
-    if not kb.inline_keyboard: await message.answer("No services available.", reply_markup=ReplyKeyboardRemove() if user_id not in ADMIN_IDS else None)
-    else: await message.answer("Select Country:", reply_markup=kb)
+    if not kb.inline_keyboard: 
+        await message.answer("No services available.", reply_markup=ReplyKeyboardRemove() if user_id not in ADMIN_IDS else None)
+    else: 
+        await message.answer("Select Country:", reply_markup=kb)
 
 @dp.callback_query(F.data == "verify_join")
 async def verify_join_handler(callback: types.CallbackQuery, state: FSMContext):
@@ -210,11 +214,12 @@ async def verify_join_handler(callback: types.CallbackQuery, state: FSMContext):
     else:
         await safe_answer(callback, text="Join First!", alert=True)
 
-# --- USER FLOW (ATOMIC ASSIGNMENT) ---
+# --- USER FLOW (CHANGE NUMBER FIX) ---
 
 @dp.callback_query(F.data.startswith("buy_"))
 async def user_buy_number(callback: types.CallbackQuery):
     user_id = callback.from_user.id
+    # 1. Answer immediately to stop loading circle
     await safe_answer(callback)
     
     if not await check_subscription(user_id):
@@ -224,31 +229,63 @@ async def user_buy_number(callback: types.CallbackQuery):
     part = callback.data.split("_")
     c_id, c_name = part[1], part[2]
     
+    # 2. Show Loading State (CRITICAL FIX for "Change Number")
+    # This prevents "Message Not Modified" errors
+    try:
+        await callback.message.edit_text(f"🔄 <b>Finding fresh number for {c_name}...</b>", reply_markup=None)
+    except Exception as e:
+        safe_print(f"Edit Error: {e}")
+
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
+    
+    # 3. Release previous number
     cursor.execute("UPDATE numbers SET status = 0, assigned_to = NULL WHERE assigned_to = ?", (user_id,))
     conn.commit()
     
     assigned_phone = None
+    
+    # 4. Attempt to get a NEW number
+    # ORDER BY RANDOM() ensures we don't get the same number in loop
     for _ in range(5):
-        row = cursor.execute("SELECT id, number FROM numbers WHERE country_id = ? AND status = 0 LIMIT 1", (c_id,)).fetchone()
-        if not row: break
+        row = cursor.execute("SELECT id, number FROM numbers WHERE country_id = ? AND status = 0 ORDER BY RANDOM() LIMIT 1", (c_id,)).fetchone()
+        
+        if not row:
+            break
+            
         num_id, phone = row
+        
+        # Atomic Lock
         cursor.execute("UPDATE numbers SET status = 1, assigned_to = ? WHERE id = ? AND status = 0", (user_id, num_id))
+        
         if cursor.rowcount > 0:
             conn.commit()
             assigned_phone = phone
             break
-        else: continue
+        else:
+            continue # Race condition, try again
             
     conn.close()
     
+    # 5. Display Result
     if not assigned_phone:
-        await safe_answer(callback, text="Stock Empty / Busy!", alert=True)
+        kb = [[InlineKeyboardButton(text="🔁 TRY AGAIN", callback_data=f"buy_{c_id}_{c_name}")], 
+              [InlineKeyboardButton(text="🔙 BACK", callback_data="show_country_list")]]
+        
+        try:
+            await callback.message.edit_text(f"⚠️ <b>Stock Empty or Busy for {c_name}!</b>\nPlease try again.", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+        except:
+            await callback.message.answer(f"⚠️ <b>Stock Empty for {c_name}!</b>")
         return
     
     text = f"🌎 {c_name} Assigned:\n<code>+{assigned_phone}</code>\n\nWaiting for OTP..."
-    kb = [[InlineKeyboardButton(text="CHANGE NUMBER", callback_data=f"buy_{c_id}_{c_name}")], [InlineKeyboardButton(text="CHANGE COUNTRY", callback_data="show_country_list")], [InlineKeyboardButton(text="CANCEL", callback_data="cancel_op")]]
+    kb = [
+        [InlineKeyboardButton(text="🔄 CHANGE NUMBER", callback_data=f"buy_{c_id}_{c_name}")], 
+        [InlineKeyboardButton(text="🌍 CHANGE COUNTRY", callback_data="show_country_list")], 
+        [InlineKeyboardButton(text="❌ CANCEL", callback_data="cancel_op")]
+    ]
+    
+    await asyncio.sleep(0.5) # Small delay to ensure user sees the "Finding..." animation
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
 @dp.callback_query(F.data == "show_country_list")
@@ -276,12 +313,12 @@ async def go_back(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
     await cancel_op(callback, state)
 
-# ================= ADMIN HANDLERS (FIXED) =================
+# ================= ADMIN HANDLERS =================
 
 # --- ADD CHANNEL ---
 @dp.message(F.text == "ADD CHANNEL", F.from_user.id.in_(ADMIN_IDS))
 async def ach(m: types.Message, state: FSMContext):
-    await state.clear() # Fix conflict
+    await state.clear()
     msg = await m.answer("Channel ID/Username:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Cancel", callback_data="back_home")]]))
     await state.update_data(last_msg_id=msg.message_id)
     await state.set_state(AdminStates.waiting_channel_id)
@@ -336,7 +373,7 @@ async def dch(c: types.CallbackQuery):
 # --- ADD COUNTRY ---
 @dp.message(F.text == "ADD COUNTRY", F.from_user.id.in_(ADMIN_IDS))
 async def ac_start(m: types.Message, state: FSMContext):
-    await state.clear() # Fix conflict
+    await state.clear()
     msg = await m.answer("Input Country Name:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Cancel", callback_data="back_home")]]))
     await state.update_data(last_msg_id=msg.message_id)
     await state.set_state(AdminStates.waiting_country_name)
@@ -384,7 +421,7 @@ async def rc_act(c: types.CallbackQuery):
 # --- ADD NUMBER ---
 @dp.message(F.text == "ADD NUMBER", F.from_user.id.in_(ADMIN_IDS))
 async def an_start(m: types.Message, state: FSMContext):
-    await state.clear() # Fix conflict
+    await state.clear()
     conn = sqlite3.connect("bot_database.db")
     cs = conn.cursor().execute("SELECT id, name FROM countries").fetchall()
     conn.close()
@@ -399,7 +436,6 @@ async def an_start(m: types.Message, state: FSMContext):
 async def an_sel(c: types.CallbackQuery, state: FSMContext):
     await safe_answer(c)
     p = c.data.split("_")
-    # p[2] = id, p[3] = name
     await state.update_data(country_id=p[2], country_name=p[3])
     btns = [[InlineKeyboardButton(text="📂 File", callback_data="in_file")], [InlineKeyboardButton(text="✍️ Written", callback_data="in_text")], [InlineKeyboardButton(text="🔙 Cancel", callback_data="back_home")]]
     msg = await c.message.edit_text(f"Selected: {p[3]}\nChoose Input Method:", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
@@ -427,7 +463,6 @@ async def an_proc(m: types.Message, state: FSMContext):
         await m.answer("Invalid input. Please send text or file.")
         return
 
-    # Improved regex for any separator
     nums = [n.strip() for n in re.split(r'[,\n\r\s]+', content) if n.strip().isdigit()]
     
     if not nums:
@@ -441,7 +476,6 @@ async def an_proc(m: types.Message, state: FSMContext):
             conn.cursor().execute("INSERT INTO numbers (country_id, number, status, assigned_to) VALUES (?, ?, 0, NULL)", (d['country_id'], n))
             added += 1
         except: 
-            # If exists, reset it
             conn.cursor().execute("UPDATE numbers SET status=0, assigned_to=NULL WHERE number=? AND country_id=?", (n, d['country_id']))
             added += 1
     
@@ -457,7 +491,7 @@ async def an_proc(m: types.Message, state: FSMContext):
 # --- BROADCAST ---
 @dp.message(F.text == "📢 BROADCAST", F.from_user.id.in_(ADMIN_IDS))
 async def bc_start(m: types.Message, state: FSMContext):
-    await state.clear() # Fix conflict
+    await state.clear()
     msg = await m.answer("Send Broadcast Message:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Cancel", callback_data="back_home")]]))
     await state.update_data(last_msg_id=msg.message_id)
     await state.set_state(AdminStates.waiting_broadcast_msg)
@@ -475,7 +509,7 @@ async def bc_send(m: types.Message, state: FSMContext):
         try: 
             await bot.copy_message(chat_id=u[0], from_chat_id=m.chat.id, message_id=m.message_id)
             cnt += 1
-            await asyncio.sleep(0.05) # Prevent flood wait
+            await asyncio.sleep(0.05)
         except: pass
         
     await sts.edit_text(f"✅ Broadcast Sent to {cnt} users.")
