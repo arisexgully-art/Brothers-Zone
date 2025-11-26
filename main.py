@@ -9,7 +9,8 @@ import hashlib
 import html
 import random
 import time
-from datetime import datetime
+import json
+from datetime import datetime, timedelta
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.default import DefaultBotProperties
@@ -25,15 +26,17 @@ from aiogram.types import (
     InlineKeyboardButton,
     ReplyKeyboardRemove
 )
+from bs4 import BeautifulSoup 
 
 # ================= CONFIGURATION =================
 
 BOT_TOKEN = "8070506568:AAE6mUi2wcXMRTnZRwHUut66Nlu1NQC8Opo"
 ADMIN_IDS = [8308179143, 5085250851]
 
-# API Settings
-API_TOKEN = "Rk5CRTSGcX9fh1WHeIVxYViVlEhaUmSDXG1Qe1dOc2ZykmZGiw=="
-API_URL = "http://51.77.216.195/crapi/dgroup/viewstats"
+# Panel Credentials
+PANEL_USER = "Momin11"
+PANEL_PASS = "Ebrahim7258"
+PANEL_URL = "http://139.99.63.204/ints" 
 
 # Group ID
 GROUP_ID = -1003472422744
@@ -56,10 +59,9 @@ async def safe_answer(callback: types.CallbackQuery, text: str = None, alert: bo
         else: await callback.answer()
     except: pass
 
-# --- DATABASE SETUP (WAL MODE ADDED) ---
+# --- DATABASE SETUP ---
 def init_db():
     conn = sqlite3.connect("bot_database.db")
-    # Enable Write-Ahead Logging for concurrency (Fixes DB Lock issues)
     conn.execute("PRAGMA journal_mode=WAL;") 
     cursor = conn.cursor()
     
@@ -140,33 +142,179 @@ def get_join_keyboard():
     kb.append([InlineKeyboardButton(text="✅ VERIFY JOIN", callback_data="verify_join")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
-# --- API Function (NUCLEAR FIX: Fresh Session Every Time) ---
-async def check_otp_api(phone_number):
-    clean_number = ''.join(filter(str.isdigit, str(phone_number)))
+# ================= PANEL SCRAPER ENGINE (VERIFIED) =================
+
+class PanelSession:
+    def __init__(self):
+        self.session = None
+        self.last_login = 0
+        # Headers matched to your Android Logs
+        self.headers = {
+            "User-Agent": "Mozilla/5.0 (Linux; Android 15; 23076PC4BI Build/AQ3A.240912.001) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.7444.102 Mobile Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+            "Accept-Language": "en-IN,en-US;q=0.9,en;q=0.8",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "X-Requested-With": "mark.via.gp"
+        }
     
-    params = {
-        'token': API_TOKEN, 
-        'filternum': clean_number, 
-        'records': 50,
-        't': int(time.time() * 1000) # Force new request
-    }
-    
-    headers = {
-        "User-Agent": f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/{random.randint(100, 130)}.0.0.0 Safari/537.36",
-        "Connection": "close" # Ensure connection closes
-    }
-    
-    # Create a BRAND NEW session for every single check
-    # This guarantees no "stuck" connections
+    async def get_session(self):
+        # Refresh session every 10 minutes
+        if self.session and (time.time() - self.last_login < 600) and not self.session.closed:
+            return self.session
+        
+        if self.session:
+            await self.session.close()
+        
+        # Unsafe cookie jar to handle panel cookies better
+        jar = aiohttp.CookieJar(unsafe=True)
+        self.session = aiohttp.ClientSession(cookie_jar=jar, headers=self.headers)
+        
+        if await self.login():
+            return self.session
+        return None
+
+    async def login(self):
+        try:
+            login_url = f"{PANEL_URL}/login"
+            
+            # 1. GET Login Page
+            async with self.session.get(login_url) as resp:
+                html_content = await resp.text()
+            
+            # 2. Captcha Solving
+            math_match = re.search(r'(\d+)\s*([\+\-\*])\s*(\d+)\s*=', html_content)
+            captcha_val = 0
+            
+            if math_match:
+                n1, op, n2 = math_match.groups()
+                if op == '+': captcha_val = int(n1) + int(n2)
+                elif op == '-': captcha_val = int(n1) - int(n2)
+                elif op == '*': captcha_val = int(n1) * int(n2)
+                safe_print(f"🔐 Solved Captcha: {n1} {op} {n2} = {captcha_val}")
+            else:
+                # Fallback
+                soup = BeautifulSoup(html_content, 'html.parser')
+                label = soup.find('label', {'for': 'capt'})
+                if label:
+                    text = label.get_text()
+                    m = re.search(r'(\d+)\s*\+\s*(\d+)', text)
+                    if m:
+                        captcha_val = int(m.group(1)) + int(m.group(2))
+                        safe_print(f"🔐 Solved Captcha (BS4): {captcha_val}")
+
+            await asyncio.sleep(1)
+
+            # 3. POST Login
+            payload = {
+                'username': PANEL_USER,
+                'password': PANEL_PASS,
+                'capt': str(captcha_val)
+            }
+            
+            post_headers = self.headers.copy()
+            post_headers["Content-Type"] = "application/x-www-form-urlencoded"
+            post_headers["Origin"] = "http://139.99.63.204"
+            post_headers["Referer"] = login_url
+            
+            async with self.session.post(f"{PANEL_URL}/signin", data=payload, headers=post_headers, allow_redirects=False) as post_resp:
+                
+                # 302 Redirect = Success
+                if post_resp.status == 302:
+                    location = post_resp.headers.get('Location', '')
+                    # Accept both absolute and relative paths
+                    if "./" in location or "agent" in location or "index" in location:
+                        self.last_login = time.time()
+                        safe_print(f"✅ Panel Login Successful (Redirected to {location})")
+                        return True
+                
+                # 200 OK = Maybe Success (if dashboard loaded directly)
+                elif post_resp.status == 200:
+                    content = await post_resp.text()
+                    if "Logout" in content or "Welcome" in content:
+                        self.last_login = time.time()
+                        safe_print("✅ Panel Login Successful (Direct)")
+                        return True
+                    else:
+                        soup = BeautifulSoup(content, 'html.parser')
+                        err_div = soup.find("div", class_="alert-error") or soup.find("div", class_="alert")
+                        err_msg = err_div.get_text().strip() if err_div else "Unknown Error"
+                        safe_print(f"❌ Login Failed. Reason: {err_msg}")
+                        return False
+                
+                return False
+
+        except Exception as e:
+            safe_print(f"❌ Login Exception: {e}")
+            return False
+
+panel_session = PanelSession()
+
+async def fetch_panel_data(phone_number):
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(API_URL, params=params, headers=headers, timeout=10) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if data.get("status") == "success" and data.get("data"):
-                        return data["data"]
-    except Exception as e: 
-        safe_print(f"⚠️ API Fail {phone_number}: {e}")
+        session = await panel_session.get_session()
+        if not session: return []
+
+        # Date Range: Today + Yesterday (To fix timezone issues)
+        now = datetime.now()
+        yesterday = now - timedelta(days=2)
+        
+        fdate1 = f"{yesterday.strftime('%Y-%m-%d')} 00:00:00"
+        fdate2 = f"{now.strftime('%Y-%m-%d')} 23:59:59"
+        
+        # Headers for AJAX Request
+        ajax_headers = {
+            "User-Agent": panel_session.headers["User-Agent"],
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "X-Requested-With": "XMLHttpRequest", # Required for JSON
+            "Referer": f"{PANEL_URL}/agent/SMSCDRStats"
+        }
+        
+        params = {
+            'fdate1': fdate1,
+            'fdate2': fdate2,
+            'fnum': phone_number,
+            'sEcho': '1',
+            'iDisplayLength': '50',
+            'iDisplayStart': '0',
+            'iColumns': '9',
+            'sColumns': ',,,,,,,,',
+            'bRegex': 'false',
+            'sSearch': ''
+        }
+        
+        url = f"{PANEL_URL}/agent/res/data_smscdr.php"
+        
+        async with session.get(url, params=params, headers=ajax_headers) as resp:
+            content_text = await resp.text()
+            
+            # Check for HTML (Session Expired)
+            if "Login" in content_text or "<html" in content_text:
+                safe_print("⚠️ Session expired (HTML received). Relogging...")
+                panel_session.last_login = 0
+                return []
+
+            try:
+                data = json.loads(content_text)
+                messages = []
+                if 'aaData' in data and data['aaData']:
+                    for row in data['aaData']:
+                        # Validating row length
+                        if len(row) > 5:
+                            # Checking phone match
+                            if phone_number in str(row[2]):
+                                messages.append({
+                                    'dt': row[0],
+                                    'message': row[5], 
+                                    'cli': row[3]
+                                })
+                return messages
+            except json.JSONDecodeError:
+                pass
+                
+    except Exception as e:
+        safe_print(f"⚠️ Scraper Error: {e}")
+        panel_session.last_login = 0 
     return []
 
 # --- Keyboards ---
@@ -185,6 +333,7 @@ def get_country_inline_keyboard():
     countries = cursor.fetchall()
     buttons = []
     for c_id, c_name in countries:
+        # Only count available numbers
         cnt = cursor.execute("SELECT COUNT(*) FROM numbers WHERE country_id = ? AND status = 0", (c_id,)).fetchone()[0]
         buttons.append([InlineKeyboardButton(text=f"{c_name} ({cnt})", callback_data=f"buy_{c_id}_{c_name}")])
     conn.close()
@@ -201,7 +350,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
     try: conn.cursor().execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,)); conn.commit()
     except: pass
     
-    # Delete active session on start
+    # Clear active session
     conn.cursor().execute("DELETE FROM numbers WHERE assigned_to = ?", (user_id,))
     conn.commit()
     conn.close()
@@ -228,7 +377,7 @@ async def verify_join_handler(callback: types.CallbackQuery, state: FSMContext):
     else:
         await safe_answer(callback, text="Join First!", alert=True)
 
-# --- USER FLOW (With DELETE logic) ---
+# --- USER FLOW ---
 
 @dp.callback_query(F.data.startswith("buy_"))
 async def user_buy_number(callback: types.CallbackQuery):
@@ -249,12 +398,13 @@ async def user_buy_number(callback: types.CallbackQuery):
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
     
-    # Completely DELETE previous number
+    # Release previous number
     cursor.execute("DELETE FROM numbers WHERE assigned_to = ?", (user_id,))
     conn.commit()
     
     assigned_phone = None
     
+    # Find new random number
     for _ in range(5):
         row = cursor.execute("SELECT id, number FROM numbers WHERE country_id = ? AND status = 0 ORDER BY RANDOM() LIMIT 1", (c_id,)).fetchone()
         if not row: break
@@ -317,7 +467,7 @@ async def go_back(callback: types.CallbackQuery, state: FSMContext):
 @dp.message(F.text == "ADD CHANNEL", F.from_user.id.in_(ADMIN_IDS))
 async def ach(m: types.Message, state: FSMContext):
     await state.clear()
-    msg = await m.answer("Channel ID/Username:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Cancel", callback_data="back_home")]]))
+    msg = await m.answer("Channel ID:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Cancel", callback_data="back_home")]]))
     await state.update_data(last_msg_id=msg.message_id)
     await state.set_state(AdminStates.waiting_channel_id)
 
@@ -325,42 +475,34 @@ async def ach(m: types.Message, state: FSMContext):
 async def ach_id(m: types.Message, state: FSMContext):
     await state.update_data(chat_id=m.text.strip())
     d = await state.get_data()
-    try: await bot.edit_message_text(chat_id=m.chat.id, message_id=d['last_msg_id'], text=f"Channel: {m.text}\nNow Send Invite Link:")
-    except: await m.answer("Invite Link:")
     await m.delete()
+    try: await bot.edit_message_text(chat_id=m.chat.id, message_id=d['last_msg_id'], text="Link:")
+    except: pass
     await state.set_state(AdminStates.waiting_channel_link)
 
 @dp.message(AdminStates.waiting_channel_link)
 async def ach_save(m: types.Message, state: FSMContext):
     d = await state.get_data()
     conn = sqlite3.connect("bot_database.db")
-    try: 
-        conn.cursor().execute("INSERT INTO channels (chat_id, invite_link) VALUES (?, ?)", (d['chat_id'], m.text.strip()))
-        conn.commit()
-        res = "✅ Channel Added."
-    except: res = "❌ Exists/Error."
+    conn.cursor().execute("INSERT INTO channels (chat_id, invite_link) VALUES (?, ?)", (d['chat_id'], m.text.strip()))
+    conn.commit()
     conn.close()
     await m.delete()
-    try: await bot.edit_message_text(chat_id=m.chat.id, message_id=d['last_msg_id'], text=res)
-    except: await m.answer(res)
+    try: await bot.edit_message_text(chat_id=m.chat.id, message_id=d['last_msg_id'], text="✅ Added")
+    except: pass
     await state.clear()
 
 @dp.message(F.text == "REMOVE CHANNEL", F.from_user.id.in_(ADMIN_IDS))
-async def rch(m: types.Message, state: FSMContext):
-    await state.clear()
+async def rch(m: types.Message):
     conn = sqlite3.connect("bot_database.db")
     chs = conn.cursor().execute("SELECT id, chat_id FROM channels").fetchall()
     conn.close()
-    if not chs:
-        await m.answer("No channels found.")
-        return
     btns = [[InlineKeyboardButton(text=f"❌ {c[1]}", callback_data=f"del_ch_{c[0]}")] for c in chs]
     btns.append([InlineKeyboardButton(text="Cancel", callback_data="back_home")])
-    await m.answer("Remove Channel:", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
+    await m.answer("Remove:", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
 
 @dp.callback_query(F.data.startswith("del_ch_"))
 async def dch(c: types.CallbackQuery):
-    await safe_answer(c)
     conn = sqlite3.connect("bot_database.db")
     conn.cursor().execute("DELETE FROM channels WHERE id=?", (c.data.split("_")[2],))
     conn.commit()
@@ -368,162 +510,128 @@ async def dch(c: types.CallbackQuery):
     await c.message.edit_text("✅ Removed.")
 
 @dp.message(F.text == "ADD COUNTRY", F.from_user.id.in_(ADMIN_IDS))
-async def ac_start(m: types.Message, state: FSMContext):
+async def ac(m: types.Message, state: FSMContext):
     await state.clear()
-    msg = await m.answer("Input Country Name:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Cancel", callback_data="back_home")]]))
+    msg = await m.answer("Country Name:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Cancel", callback_data="back_home")]]))
     await state.update_data(last_msg_id=msg.message_id)
     await state.set_state(AdminStates.waiting_country_name)
 
 @dp.message(AdminStates.waiting_country_name)
-async def ac_save(m: types.Message, state: FSMContext):
+async def ac_s(m: types.Message, state: FSMContext):
     conn = sqlite3.connect("bot_database.db")
-    try: 
-        conn.cursor().execute("INSERT INTO countries (name) VALUES (?)", (m.text.strip(),))
-        conn.commit()
-        res = f"✅ Country '{m.text}' Added."
-    except: res = "❌ Already Exists."
+    conn.cursor().execute("INSERT INTO countries (name) VALUES (?)", (m.text.strip(),))
+    conn.commit()
     conn.close()
     await m.delete()
     d = await state.get_data()
-    try: await bot.edit_message_text(chat_id=m.chat.id, message_id=d['last_msg_id'], text=res)
-    except: await m.answer(res)
+    try: await bot.edit_message_text(chat_id=m.chat.id, message_id=d['last_msg_id'], text="✅ Added")
+    except: pass
     await state.clear()
 
 @dp.message(F.text == "REMOVE COUNTRY", F.from_user.id.in_(ADMIN_IDS))
-async def rc_start(m: types.Message, state: FSMContext):
-    await state.clear()
+async def rc(m: types.Message):
     conn = sqlite3.connect("bot_database.db")
     cs = conn.cursor().execute("SELECT id, name FROM countries").fetchall()
     conn.close()
-    if not cs:
-        await m.answer("No countries found.")
-        return
     btns = [[InlineKeyboardButton(text=f"❌ {c[1]}", callback_data=f"del_c_{c[0]}")] for c in cs]
     btns.append([InlineKeyboardButton(text="Cancel", callback_data="back_home")])
-    await m.answer("Remove Country:", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
+    await m.answer("Remove:", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
 
 @dp.callback_query(F.data.startswith("del_c_"))
-async def rc_act(c: types.CallbackQuery):
-    await safe_answer(c)
+async def rca(c: types.CallbackQuery):
     cid = c.data.split("_")[2]
     conn = sqlite3.connect("bot_database.db")
     conn.cursor().execute("DELETE FROM countries WHERE id=?", (cid,))
     conn.cursor().execute("DELETE FROM numbers WHERE country_id=?", (cid,))
     conn.commit()
     conn.close()
-    await c.message.edit_text("✅ Country & Numbers Removed.")
+    await c.message.edit_text("✅ Removed")
 
 @dp.message(F.text == "ADD NUMBER", F.from_user.id.in_(ADMIN_IDS))
-async def an_start(m: types.Message, state: FSMContext):
+async def an(m: types.Message, state: FSMContext):
     await state.clear()
     conn = sqlite3.connect("bot_database.db")
     cs = conn.cursor().execute("SELECT id, name FROM countries").fetchall()
     conn.close()
-    if not cs:
-        await m.answer("Add a Country first!")
-        return
     btns = [[InlineKeyboardButton(text=c[1], callback_data=f"sel_cn_{c[0]}_{c[1]}")] for c in cs]
     btns.append([InlineKeyboardButton(text="Cancel", callback_data="back_home")])
-    await m.answer("Select Country for Numbers:", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
+    await m.answer("Select:", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
 
 @dp.callback_query(F.data.startswith("sel_cn_"))
-async def an_sel(c: types.CallbackQuery, state: FSMContext):
-    await safe_answer(c)
+async def ans(c: types.CallbackQuery, state: FSMContext):
     p = c.data.split("_")
     await state.update_data(country_id=p[2], country_name=p[3])
-    btns = [[InlineKeyboardButton(text="📂 File", callback_data="in_file")], [InlineKeyboardButton(text="✍️ Written", callback_data="in_text")], [InlineKeyboardButton(text="🔙 Cancel", callback_data="back_home")]]
-    msg = await c.message.edit_text(f"Selected: {p[3]}\nChoose Input Method:", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
+    msg = await c.message.edit_text(f"Sel: {p[3]}\nMethod:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📂 File", callback_data="in_file")], [InlineKeyboardButton(text="✍️ Written", callback_data="in_text")]]))
     await state.update_data(last_msg_id=msg.message_id)
 
 @dp.callback_query(F.data.in_({"in_file", "in_text"}))
-async def an_inp(c: types.CallbackQuery, state: FSMContext):
-    await safe_answer(c)
+async def ani(c: types.CallbackQuery, state: FSMContext):
     await state.update_data(mode=c.data)
-    msg = await c.message.edit_text("Send numbers (One per line or Comma separated):", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Cancel", callback_data="back_home")]]))
+    msg = await c.message.edit_text("Input:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Cancel", callback_data="back_home")]]))
     await state.update_data(last_msg_id=msg.message_id)
     await state.set_state(AdminStates.waiting_number_input)
 
 @dp.message(AdminStates.waiting_number_input)
-async def an_proc(m: types.Message, state: FSMContext):
+async def anp(m: types.Message, state: FSMContext):
     d = await state.get_data()
-    content = ""
-    
+    c = ""
     if d['mode'] == "in_file" and m.document: 
         f = await bot.get_file(m.document.file_id)
-        content = (await bot.download_file(f.file_path)).read().decode('utf-8')
-    elif d['mode'] == "in_text" and m.text: 
-        content = m.text
-    else: 
-        await m.answer("Invalid input. Please send text or file.")
-        return
-
-    nums = [n.strip() for n in re.split(r'[,\n\r\s]+', content) if n.strip().isdigit()]
+        c = (await bot.download_file(f.file_path)).read().decode('utf-8')
+    elif d['mode'] == "in_text": 
+        c = m.text
     
-    if not nums:
-        await m.answer("No valid numbers found.")
-        return
-
+    nums = [n.strip() for n in re.split(r'[,\n\r\s]+', c) if n.strip().isdigit()]
     conn = sqlite3.connect("bot_database.db")
-    added = 0
-    for n in nums:
-        try: 
-            conn.cursor().execute("INSERT INTO numbers (country_id, number, status, assigned_to) VALUES (?, ?, 0, NULL)", (d['country_id'], n))
-            added += 1
-        except: 
-            conn.cursor().execute("UPDATE numbers SET status=0, assigned_to=NULL WHERE number=? AND country_id=?", (n, d['country_id']))
-            added += 1
-    
+    a = 0
+    for n in nums: 
+        conn.cursor().execute("INSERT OR REPLACE INTO numbers (country_id, number, status, assigned_to) VALUES (?, ?, 0, NULL)", (d['country_id'], n))
+        a += 1
     conn.commit()
     conn.close()
     await m.delete()
-    
-    msg_text = f"✅ Added/Reset {added} numbers to {d.get('country_name')}."
-    try: await bot.edit_message_text(chat_id=m.chat.id, message_id=d['last_msg_id'], text=msg_text)
-    except: await m.answer(msg_text)
+    try: await bot.edit_message_text(chat_id=m.chat.id, message_id=d['last_msg_id'], text=f"✅ Added {a}")
+    except: pass
     await state.clear()
 
 @dp.message(F.text == "📢 BROADCAST", F.from_user.id.in_(ADMIN_IDS))
-async def bc_start(m: types.Message, state: FSMContext):
+async def bcs(m: types.Message, state: FSMContext):
     await state.clear()
-    msg = await m.answer("Send Broadcast Message:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Cancel", callback_data="back_home")]]))
+    msg = await m.answer("Msg:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Cancel", callback_data="back_home")]]))
     await state.update_data(last_msg_id=msg.message_id)
     await state.set_state(AdminStates.waiting_broadcast_msg)
 
 @dp.message(AdminStates.waiting_broadcast_msg)
-async def bc_send(m: types.Message, state: FSMContext):
+async def bcd(m: types.Message, state: FSMContext):
     conn = sqlite3.connect("bot_database.db")
     us = conn.cursor().execute("SELECT user_id FROM users").fetchall()
     conn.close()
-    
-    cnt = 0
-    sts = await m.answer("📢 Sending broadcast...")
-    
-    for u in us:
+    c = 0
+    for u in us: 
         try: 
-            await bot.copy_message(chat_id=u[0], from_chat_id=m.chat.id, message_id=m.message_id)
-            cnt += 1
+            await bot.copy_message(u[0], m.chat.id, m.message_id)
+            c += 1
             await asyncio.sleep(0.05)
         except: pass
-        
-    await sts.edit_text(f"✅ Broadcast Sent to {cnt} users.")
+    await m.answer(f"Sent {c}")
     await state.clear()
 
-# ================= ROBUST MASTER POLLING (DEBUG ENABLED) =================
+# ================= POLLING LOGIC =================
 
 async def process_number_task(user_id, phone, c_id, countries):
     try:
-        # Check API with fresh session
-        msgs = await check_otp_api(phone)
+        msgs = await fetch_panel_data(phone)
         
         if not msgs: return
 
-        # Loop through all messages without strict sorting first
-        for msg in msgs:
+        for msg in sorted(msgs, key=lambda x: x['dt']):
             msg_body = msg.get("message", "")
+            msg_dt = msg.get("dt", "")
+            
             if not msg_body: continue
 
-            # Robust Signature (Body + Timestamp)
-            sig_raw = f"{msg.get('dt', '')}{msg_body}{phone}"
+            # Robust Signature (Time + Body + Phone)
+            sig_raw = f"{msg_dt}{msg_body}{phone}"
             sig = hashlib.md5(sig_raw.encode()).hexdigest()
             
             conn = sqlite3.connect("bot_database.db")
@@ -535,20 +643,18 @@ async def process_number_task(user_id, phone, c_id, countries):
                 conn.commit()
                 
                 country_name = countries.get(c_id, "Unknown")
-                svc = msg.get("cli", "Service")
-                svc = svc.capitalize() if svc and svc != "null" else "Unknown"
+                svc = msg.get("cli", "WhatsApp")
                 
                 otp_match = re.search(r'(?:\d{3}[-\s]\d{3})|(?<!\d)\d{4,8}(?!\d)', msg_body)
                 otp = otp_match.group(0) if otp_match else "N/A"
                 
                 safe_msg = html.escape(msg_body)
-                ctime = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 masked = f"{phone[:4]}***{phone[-4:]}" if len(phone) > 7 else phone
                 
                 utxt = f"🌎 Country : {country_name}\n🔢 Number : <code>{phone}</code>\n🔑 OTP : <code>{otp}</code>\n💸 Reward: 🔥"
-                gtxt = f"✅ {country_name} {svc} OTP Received!\n━━━━━━━━━━━━━━━━━━━━\n📱 Number: <code>{masked}</code>\n🌍 Country: {country_name}\n⚙️ Service: {svc}\n🔒 OTP Code: <code>{otp}</code>\n⏳ Time: {ctime}\n━━━━━━━━━━━━━━━━━━━━\nMessage:\n{safe_msg}"
+                gtxt = f"✅ {country_name} {svc} OTP Received!\n━━━━━━━━━━━━━━━━━━━━\n📱 Number: <code>{masked}</code>\n🌍 Country: {country_name}\n⚙️ Service: {svc}\n🔒 OTP Code: <code>{otp}</code>\n⏳ Time: {msg_dt}\n━━━━━━━━━━━━━━━━━━━━\nMessage:\n{safe_msg}"
                 
-                safe_print(f"✅ FOUND OTP for {user_id} on {phone}: {otp}")
+                safe_print(f"✅ FOUND OTP for {user_id}: {otp}")
                 
                 try: await bot.send_message(user_id, utxt)
                 except: pass
@@ -561,11 +667,10 @@ async def process_number_task(user_id, phone, c_id, countries):
         safe_print(f"⚠️ Error processing {phone}: {e}")
 
 async def master_polling_loop():
-    safe_print("🚀 Master Polling Loop Started...")
+    safe_print("🚀 Panel Scraper Polling Started...")
     
     while True:
         try:
-            # 1. Fetch Active Orders
             conn = sqlite3.connect("bot_database.db")
             active_orders = conn.cursor().execute("SELECT assigned_to, number, country_id FROM numbers WHERE status = 1").fetchall()
             countries = {row[0]: row[1] for row in conn.cursor().execute("SELECT id, name FROM countries").fetchall()}
@@ -574,19 +679,15 @@ async def master_polling_loop():
             if not active_orders:
                 await asyncio.sleep(2)
                 continue
+            
+            # safe_print(f"📡 Tracking {len(active_orders)} numbers via Panel...")
 
-            # DEBUG: Print active numbers to console to verify switch
-            # This helps confirm if the bot is tracking the NEW number
-            print(f"📡 Polling {len(active_orders)} numbers: {[x[1] for x in active_orders]}")
-
-            # 2. Parallel Processing
             tasks = []
             for user_id, phone, c_id in active_orders:
                 tasks.append(process_number_task(user_id, phone, c_id, countries))
             
             await asyncio.gather(*tasks)
-            
-            await asyncio.sleep(1)
+            await asyncio.sleep(2)
 
         except Exception as e:
             safe_print(f"Loop Error: {e}")
